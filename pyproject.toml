@@ -1,0 +1,5 @@
+[project]
+name = "insure-me"
+version = "0.1.0"
+description = "Vision-powered home inventory builder"
+requires-python = ">=3.12"

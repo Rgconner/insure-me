@@ -1,0 +1,50 @@
+networks:
+  insure-me-net:
+    driver: bridge
+
+volumes:
+  insure-me-db:
+
+services:
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    networks:
+      - insure-me-net
+    restart: unless-stopped
+
+  backend:
+    build: ./server/backend
+    ports:
+      - "8000:8000"
+    environment:
+      REDIS_URL: redis://redis:6379
+      DATABASE_URL: sqlite:///./insure-me.db
+      VISION_PRIMARY: google
+      VISION_SECONDARY: openai
+      VISION_PRIMARY_KEY: ${VISION_PRIMARY_KEY:-}
+      VISION_SECONDARY_KEY: ${VISION_SECONDARY_KEY:-}
+      SEARCH_API_KEY: ${SEARCH_API_KEY:-}
+      LLM_API_KEY: ${LLM_API_KEY:-}
+      EXTERNAL_TIMEOUT_SECONDS: "15"
+    volumes:
+      - insure-me-db:/app
+      - ./uploads:/app/uploads
+    depends_on:
+      - redis
+    networks:
+      - insure-me-net
+    restart: unless-stopped
+
+  web-ui:
+    build: ./server/web_ui
+    ports:
+      - "5173:5173"
+    environment:
+      VITE_API_URL: http://localhost:8000
+    depends_on:
+      - backend
+    networks:
+      - insure-me-net
+    restart: unless-stopped
