@@ -7,13 +7,13 @@
 ## Current State (2026-08-19 — session 1)
 
 **Branch:** `main`
-**Last commit:** Initial scaffold
+**Last commit:** `6589d98` — Initial scaffold
 **CI status:** Not yet configured
-**System state:** Repo created, 9 cards on board, project scaffolded
+**System state:** Repo created, 12 cards on board, project scaffolded and pushed
 
 ## Board
 
-[insure-me issues](https://github.com/Rgconner/insure-me/issues) — 9 open cards
+[insure-me issues](https://github.com/Rgconner/insure-me/issues) — 12 open cards
 
 | # | Card |
 |---|------|
@@ -26,10 +26,13 @@
 | 7 | Repo & Project Scaffold |
 | 8 | External Call Resilience — Timeouts + Error Handling |
 | 9 | Message Tracking — Redis Pub/Sub Pipeline |
+| 10 | Narration / Voice Input — Speak Item Details |
+| 11 | GPS + Timestamp Provenance |
+| 12 | Certificate of Authentication Capture |
 
 ## Immediate First Action Next Session
 
-**→ Scaffold backend and frontend (card #7), then start on Capture Frame (#1).**
+**→ Start on Capture Frame (#1) — camera viewfinder in the browser.**
 
 ---
 
