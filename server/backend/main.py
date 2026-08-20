@@ -59,6 +59,11 @@ VISION_SECONDARY_KEY = os.getenv("VISION_SECONDARY_KEY", "")
 SEARCH_API_KEY = os.getenv("SEARCH_API_KEY", "")
 LLM_API_KEY = os.getenv("LLM_API_KEY", "")
 
+# OpenAI-compatible LLM endpoint. Defaults to OpenAI; point at a local
+# vision/LLM server (LM Studio / Ollama) by setting LLM_BASE_URL + LLM_MODEL.
+LLM_BASE_URL = os.getenv("LLM_BASE_URL", "https://api.openai.com/v1").rstrip("/")
+LLM_MODEL = os.getenv("LLM_MODEL", "gpt-4o")
+
 # External call timeouts (card #8)
 DEFAULT_TIMEOUT = float(os.getenv("EXTERNAL_TIMEOUT_SECONDS", "15.0"))
 
@@ -108,6 +113,33 @@ def publish_dead_letter(trace_id: str, stage: str, error: str, payload: dict = N
         "error": error,
         "original_payload": payload or {},
     }, source=SERVICE_NAME)
+
+
+# Pipeline state store — the /api/capture/{trace_id} endpoint reads this so the
+# browser can poll for the identification/pricing result. Keys expire after a
+# short TTL (no unbounded growth).
+TRACE_TTL = 300  # seconds
+
+def _trace_key(trace_id: str) -> str:
+    return f"insure-me:trace:{trace_id}"
+
+
+def store_trace_state(trace_id: str, state: dict) -> None:
+    """Persist the latest pipeline state for a trace_id (JSON in Redis)."""
+    try:
+        redis_client.set(_trace_key(trace_id), json.dumps(state), ex=TRACE_TTL)
+    except Exception as e:
+        logger.error(f"[{trace_id}] failed to store trace state: {e}")
+
+
+def get_trace_state(trace_id: str) -> dict:
+    """Read pipeline state for a trace_id (empty dict if absent)."""
+    try:
+        raw = redis_client.get(_trace_key(trace_id))
+        return json.loads(raw) if raw else {}
+    except Exception as e:
+        logger.error(f"[{trace_id}] failed to read trace state: {e}")
+        return {}
 
 # ---------------------------------------------------------------------------
 # Database
@@ -271,6 +303,11 @@ async def capture_photo(file: UploadFile):
         "photo_path": str(photo_path),
     }, source=SERVICE_NAME)
 
+    store_trace_state(trace_id, {
+        "status": "captured",
+        "photo_filename": photo_filename,
+    })
+
     asyncio.create_task(run_identification(trace_id, str(photo_path)))
 
     return {
@@ -282,12 +319,11 @@ async def capture_photo(file: UploadFile):
 
 @app.get("/api/capture/{trace_id}")
 async def capture_status(trace_id: str):
-    """Check status of a capture/identify/price pipeline by trace_id."""
-    return {
-        "trace_id": trace_id,
-        "status": "processing",
-        "note": "Poll or subscribe to Redis channels for live status",
-    }
+    """Return the live pipeline status for a capture (driven by Redis state)."""
+    state = get_trace_state(trace_id)
+    if not state:
+        return {"trace_id": trace_id, "status": "unknown"}
+    return state
 
 # ---------------------------------------------------------------------------
 # Identification — Vision Router (card #2/#3/#4)
@@ -336,6 +372,10 @@ async def run_identification(trace_id: str, photo_path: str):
             "error": "Both vision sources failed",
         }, source=SERVICE_NAME)
         publish_dead_letter(trace_id, "identify", "Both sources failed")
+        store_trace_state(trace_id, {
+            "status": "failed",
+            "error": "Both vision sources failed",
+        })
         return
 
     result = {
@@ -345,6 +385,12 @@ async def run_identification(trace_id: str, photo_path: str):
         "primary_source": VISION_PRIMARY if primary_result else None,
         "secondary_source": VISION_SECONDARY if secondary_result else None,
     }
+
+    store_trace_state(trace_id, {
+        "status": "identified",
+        "identified_name": identified_name,
+        "confidence": confidence,
+    })
 
     publish_event(CHANNEL_IDENTIFY, trace_id, f"identified:{confidence}", result,
                   source=SERVICE_NAME)
@@ -359,7 +405,7 @@ async def identify_with_source(client: httpx.AsyncClient, source: str, api_key: 
 
     if source_lower == "google":
         return await _identify_google(client, api_key, photo_path, trace_id)
-    elif source_lower == "openai":
+    elif source_lower in ("openai", "local"):
         return await _identify_openai(client, api_key, photo_path, trace_id)
     else:
         logger.warning(f"[{trace_id}] Unknown vision source: {source} — using placeholder")
@@ -491,9 +537,6 @@ async def _identify_google(client: httpx.AsyncClient, api_key: str,
 # OpenAI GPT-4V / GPT-4o (card #4)
 # ---------------------------------------------------------------------------
 
-OPENAI_VISION_URL = "https://api.openai.com/v1/chat/completions"
-
-
 async def _identify_openai(client: httpx.AsyncClient, api_key: str,
                             photo_path: str, trace_id: str) -> Optional[dict]:
     """
@@ -512,7 +555,7 @@ async def _identify_openai(client: httpx.AsyncClient, api_key: str,
         return None
 
     payload = {
-        "model": "gpt-4o",
+        "model": LLM_MODEL,
         "messages": [{
             "role": "user",
             "content": [
@@ -545,7 +588,7 @@ async def _identify_openai(client: httpx.AsyncClient, api_key: str,
     logger.info(f"[{trace_id}] Calling OpenAI GPT-4o...")
 
     try:
-        resp = await client.post(OPENAI_VISION_URL, json=payload, headers=headers)
+        resp = await client.post(f"{LLM_BASE_URL}/chat/completions", json=payload, headers=headers)
         resp.raise_for_status()
         data = resp.json()
     except httpx.HTTPError as e:
@@ -610,6 +653,11 @@ async def run_pricing(trace_id: str, identified_name: str):
             "error": "Could not estimate value",
         }, source=SERVICE_NAME)
         publish_dead_letter(trace_id, "price", "All pricing sources failed")
+        store_trace_state(trace_id, {
+            "status": "identified",
+            "identified_name": identified_name,
+            "price_error": "Could not estimate value",
+        })
         return
 
     result = {
@@ -618,6 +666,13 @@ async def run_pricing(trace_id: str, identified_name: str):
         "estimated_value": value,
         "value_source": value_source,
     }
+
+    store_trace_state(trace_id, {
+        "status": "priced",
+        "identified_name": identified_name,
+        "estimated_value": value,
+        "value_source": value_source,
+    })
 
     publish_event(CHANNEL_PRICE, trace_id, f"priced:{value_source}", result,
                   source=SERVICE_NAME)
@@ -724,9 +779,6 @@ def _extract_price_from_text(text: str) -> Optional[float]:
 # Pricing — LLM estimate (card #5 — fallback)
 # ---------------------------------------------------------------------------
 
-LLM_API_URL = "https://api.openai.com/v1/chat/completions"
-
-
 async def llm_estimate(client: httpx.AsyncClient, item_name: str, trace_id: str) -> Optional[float]:
     """Ask OpenAI to estimate replacement cost. Returns float or None."""
     api_key = LLM_API_KEY
@@ -735,7 +787,7 @@ async def llm_estimate(client: httpx.AsyncClient, item_name: str, trace_id: str)
         return None
 
     payload = {
-        "model": "gpt-4o",
+        "model": LLM_MODEL,
         "messages": [{
             "role": "user",
             "content": (
@@ -756,7 +808,7 @@ async def llm_estimate(client: httpx.AsyncClient, item_name: str, trace_id: str)
     logger.info(f"[{trace_id}] LLM price estimate: \"{item_name}\"")
 
     try:
-        resp = await client.post(LLM_API_URL, json=payload, headers=headers)
+        resp = await client.post(f"{LLM_BASE_URL}/chat/completions", json=payload, headers=headers)
         resp.raise_for_status()
         data = resp.json()
     except httpx.HTTPError as e:

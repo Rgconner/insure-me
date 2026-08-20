@@ -11,9 +11,11 @@ data:
   REDIS_URL: "redis://redis:6379"
   DATABASE_URL: "sqlite:////data/insure-me.db"
   UPLOAD_DIR: "/data/uploads"
-  VISION_PRIMARY: "google"
-  VISION_SECONDARY: "openai"
-  EXTERNAL_TIMEOUT_SECONDS: "15"
+  VISION_PRIMARY: "local"
+  VISION_SECONDARY: "local"
+  EXTERNAL_TIMEOUT_SECONDS: "120"
+  LLM_BASE_URL: "http://192.168.1.80:1234/v1"
+  LLM_MODEL: "qwen2.5-vl-7b-instruct"
   SERVICE_VERSION: "0.1.0"
 ---
 # Persistent volume for SQLite DB + uploaded photos.

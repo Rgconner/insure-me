@@ -1,4 +1,4 @@
-import { useState, useCallback } from 'react';
+import { useState, useCallback, useEffect } from 'react';
 
 export interface InventoryItem {
   id: string;
@@ -25,16 +25,24 @@ interface DocItem {
 interface Props {
   items: InventoryItem[];
   photoFilename: string | null;
+  suggestedName: string | null;
+  suggestedValue: string | null;
   onRefresh: () => void;
 }
 
-export function InventoryList({ items, photoFilename, onRefresh }: Props) {
+export function InventoryList({ items, photoFilename, suggestedName, suggestedValue, onRefresh }: Props) {
   const [adding, setAdding] = useState(false);
   const [editingId, setEditingId] = useState<string | null>(null);
   const [deletingId, setDeletingId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [newName, setNewName] = useState('');
   const [newValue, setNewValue] = useState('');
+
+  // Prefill the Add-to-Catalog form when identification/pricing settle.
+  useEffect(() => {
+    if (suggestedName) setNewName(suggestedName);
+    if (suggestedValue) setNewValue(suggestedValue);
+  }, [suggestedName, suggestedValue]);
   const [editName, setEditName] = useState('');
   const [editValue, setEditValue] = useState('');
   const [expandedDocs, setExpandedDocs] = useState<string | null>(null);
