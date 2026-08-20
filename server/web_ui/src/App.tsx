@@ -37,6 +37,11 @@ function App() {
     try {
       const form = new FormData();
       form.append("file", blob, "capture.jpg");
+      form.append("narration", narration);
+      if (lat != null && lng != null) {
+        form.append("lat", String(lat));
+        form.append("lng", String(lng));
+      }
 
       const res = await fetch("/api/capture", { method: "POST", body: form });
       if (!res.ok) {
