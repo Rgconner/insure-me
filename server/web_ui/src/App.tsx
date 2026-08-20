@@ -49,7 +49,7 @@ function App() {
         if (r.ok) {
           const s: PipelineResult = await r.json();
           setPipeline(s);
-          if (["priced", "identified", "failed"].includes(s.status)) {
+          if (["priced", "failed"].includes(s.status)) {
             return;
           }
         }

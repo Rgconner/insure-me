@@ -697,9 +697,13 @@ async def run_pricing(trace_id: str, identified_name: str):
         "value_source": value_source,
     }
 
+    # Carry the identification confidence forward into the priced state so
+    # the UI can show it (the pricing step doesn't re-derive it).
+    prior = get_trace_state(trace_id)
     store_trace_state(trace_id, {
         "status": "priced",
         "identified_name": identified_name,
+        "confidence": prior.get("confidence", ""),
         "estimated_value": value,
         "value_source": value_source,
     })
