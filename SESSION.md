@@ -7,9 +7,9 @@
 ## Current State (2026-08-19 — session 1)
 
 **Branch:** `main`
-**Last commit:** `6589d98` — Initial scaffold
+**Last commit:** `1ff4f89` — Update board: 12 cards
 **CI status:** Not yet configured
-**System state:** Repo created, 12 cards on board, project scaffolded and pushed
+**System state:** Card #1 (Capture Frame) implemented — camera hook + viewfinder + capture + backend POST. Inventory list shows results.
 
 ## Board
 
@@ -32,7 +32,7 @@
 
 ## Immediate First Action Next Session
 
-**→ Start on Capture Frame (#1) — camera viewfinder in the browser.**
+**→ Wire up Vision Router (#2) — plug real vision API calls into identify_with_source().**
 
 ---
 
