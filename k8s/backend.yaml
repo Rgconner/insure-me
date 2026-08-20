@@ -57,7 +57,7 @@ spec:
       containers:
         - name: backend
           image: git.snwbd.com/aikb-admin/insure-me/backend:latest
-          imagePullPolicy: IfNotPresent
+          imagePullPolicy: Always
           ports:
             - containerPort: 8000
               name: http

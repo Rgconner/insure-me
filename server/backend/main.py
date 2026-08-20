@@ -540,7 +540,7 @@ async def _identify_google(client: httpx.AsyncClient, api_key: str,
 async def _identify_openai(client: httpx.AsyncClient, api_key: str,
                             photo_path: str, trace_id: str) -> Optional[dict]:
     """
-    Send frame to OpenAI GPT-4o for vision-based identification.
+    Send frame to an OpenAI-compatible vision LLM (OpenAI or local LM Studio).
     Returns structured JSON: {name, category, confidence}.
     """
     if not api_key:
@@ -585,7 +585,7 @@ async def _identify_openai(client: httpx.AsyncClient, api_key: str,
         "Content-Type": "application/json",
     }
 
-    logger.info(f"[{trace_id}] Calling OpenAI GPT-4o...")
+    logger.info(f"[{trace_id}] Calling vision LLM ({LLM_MODEL})...")
 
     try:
         resp = await client.post(f"{LLM_BASE_URL}/chat/completions", json=payload, headers=headers)
@@ -595,7 +595,9 @@ async def _identify_openai(client: httpx.AsyncClient, api_key: str,
         logger.error(f"[{trace_id}] OpenAI HTTP error: {e}")
         return None
 
-    # Parse structured JSON from GPT-4o response
+    # Parse structured JSON from the LLM response. Local models are
+    # unpredictable — coerce "name" to a plain string and "confidence" to a
+    # float regardless of what shape the model returns.
     try:
         content = data["choices"][0]["message"]["content"]
         content = content.strip()
@@ -604,15 +606,37 @@ async def _identify_openai(client: httpx.AsyncClient, api_key: str,
             content = content.split("\n", 1)[1] if "\n" in content else content[3:]
             if content.endswith("```"):
                 content = content[:-3]
+        logger.info(f"[{trace_id}] LLM raw: {content[:200]}")
         result = json.loads(content.strip())
+
+        name = result.get("name", "Unknown")
+        if isinstance(name, dict):
+            name = " ".join(str(v) for v in name.values() if v)
+        elif isinstance(name, list):
+            name = " ".join(str(v) for v in name if v)
+        elif not isinstance(name, str):
+            name = str(name)
+
+        category = result.get("category", "general")
+        if isinstance(category, dict):
+            category = " ".join(str(v) for v in category.values() if v)
+        elif not isinstance(category, str):
+            category = str(category)
+
+        raw_conf = result.get("confidence", 0.5)
+        try:
+            confidence = float(raw_conf)
+        except (TypeError, ValueError):
+            confidence = 0.5
+
         return {
-            "name": result.get("name", "Unknown"),
-            "category": result.get("category", "general"),
+            "name": name or "Unknown",
+            "category": category or "general",
             "source": "openai",
-            "raw_confidence": float(result.get("confidence", 0.5)),
+            "raw_confidence": confidence,
         }
-    except (KeyError, json.JSONDecodeError, IndexError) as e:
-        logger.error(f"[{trace_id}] Failed to parse OpenAI response: {e}")
+    except (KeyError, json.JSONDecodeError, IndexError, TypeError) as e:
+        logger.error(f"[{trace_id}] Failed to parse LLM response: {e}")
         return None
 
 

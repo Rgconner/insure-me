@@ -73,7 +73,7 @@ spec:
       containers:
         - name: web-ui
           image: git.snwbd.com/aikb-admin/insure-me/web-ui:latest
-          imagePullPolicy: IfNotPresent
+          imagePullPolicy: Always
           ports:
             - containerPort: 80
               name: http
