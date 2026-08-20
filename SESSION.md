@@ -4,12 +4,35 @@
 
 ---
 
-## Current State (2026-08-19 — session 1)
+## Current State (2026-08-20 — session 1, deployed)
 
 **Branch:** `main`
-**Last commit:** `b1e650a` — feat(#10): Voice Narration
-**CI status:** Not yet configured
-**System state:** ALL 12 CARDS COMPLETE. Prototype scaffolded with full pipeline: capture → dual-source vision → pricing → catalog CRUD with voice narration, GPS, and document attachments.
+**Last commit:** `d7b8fed` — deploy: Recreate strategy for backend (RWO PVC multi-attach fix)
+**CI status:** Not applicable — images built in-cluster via Kaniko → `git.snwbd.com/aikb-admin/insure-me/*`
+**System state:** ALL 12 CARDS COMPLETE + **deployed to k8s** in own `insure-me` namespace.
+
+### Deployment status (cluster `192.168.10.101`)
+
+| Component | State |
+|-----------|-------|
+| namespace `insure-me` | ✅ created |
+| redis | ✅ 1/1 Running |
+| backend (FastAPI) | ✅ 1/1 Running — `/health` 200, `/api/inventory` 200 |
+| web-ui (nginx SPA) | ✅ 1/1 Running — serves `http://192.168.11.215/` |
+| MetalLB LoadBalancer | ✅ `192.168.11.215` (sandbox pool) |
+| Traefik IngressRoutes | ✅ `insure-me-http` (redirect) + `insure-me-https` (letsencrypt) for `insure-me.snwbd.com` |
+| cloudflared-tunnel | ⚠️ CrashLoopBackOff — **tunnel token empty, needs Cloudflare dashboard token** |
+
+### Images
+Built in-cluster with Kaniko (`k8s/kaniko-build.yaml`), pushed to internal gitea registry:
+- `git.snwbd.com/aikb-admin/insure-me/backend:latest`
+- `git.snwbd.com/aikb-admin/insure-me/web-ui:latest`
+Pull auth via `gitea-registry` secret (copied into `insure-me` ns).
+
+### Two remaining action items
+1. **Cloudflare tunnel token** — create the named-tunnel token for `insure-me.snwbd.com` in the Cloudflare dashboard, then:
+   `kubectl -n insure-me edit secret tunnel-token` (set `token` value) → pods auto-recover.
+2. **Vision/LLM API keys** — set into `insure-me-secrets` (VISION_PRIMARY_KEY, VISION_SECONDARY_KEY, SEARCH_API_KEY, LLM_API_KEY) to activate identification + pricing.
 
 ## Board
 
