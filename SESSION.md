@@ -7,9 +7,9 @@
 ## Current State (2026-08-19 — session 1)
 
 **Branch:** `main`
-**Last commit:** `1ff4f89` — Update board: 12 cards
+**Last commit:** `b3a0fb2` — feat(#1): Capture Frame
 **CI status:** Not yet configured
-**System state:** Card #1 (Capture Frame) implemented — camera hook + viewfinder + capture + backend POST. Inventory list shows results.
+**System state:** Cards #1-#4 complete. Camera capture → Google Vision + GPT-4o identification → cross-check. 8 cards open.
 
 ## Board
 
@@ -32,7 +32,18 @@
 
 ## Immediate First Action Next Session
 
-**→ Wire up Vision Router (#2) — plug real vision API calls into identify_with_source().**
+**→ Wire up Value Estimation (#5) — replace search_price() and llm_estimate() stubs with real web search and LLM calls.**
+
+---
+
+## What Shipped This Session
+
+| Commit | Card | What |
+|--------|------|------|
+| `b3a0fb2` | #1 | Capture Frame — camera hook + viewfinder + POST to backend |
+| (pending) | #2 | Vision Router — dispatch routing + cross-check confidence |
+| (pending) | #3 | Google Vision API — REST integration, label/object/web detection |
+| (pending) | #4 | OpenAI GPT-4o — structured JSON identification |
 
 ---
 

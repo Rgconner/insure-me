@@ -9,6 +9,7 @@ All pipeline messages published via Redis pub/sub per card #9.
 """
 
 import asyncio
+import base64
 import json
 import logging
 import os
@@ -330,15 +331,225 @@ async def run_identification(trace_id: str, photo_path: str):
 
 async def identify_with_source(client: httpx.AsyncClient, source: str, api_key: str,
                                 photo_path: str, trace_id: str) -> Optional[dict]:
-    """Call a vision API. PLACEHOLDER — real implementations in cards #3 and #4."""
-    logger.info(f"[{trace_id}] Identifying with {source}...")
-    await asyncio.sleep(0.5)
-    return {
-        "name": f"Item identified by {source}",
-        "category": "general",
-        "source": source,
-        "raw_confidence": 0.85,
+    """Dispatch to the appropriate vision API implementation."""
+    source_lower = source.lower()
+
+    if source_lower == "google":
+        return await _identify_google(client, api_key, photo_path, trace_id)
+    elif source_lower == "openai":
+        return await _identify_openai(client, api_key, photo_path, trace_id)
+    else:
+        logger.warning(f"[{trace_id}] Unknown vision source: {source} — using placeholder")
+        await asyncio.sleep(0.5)
+        return {
+            "name": f"Item identified by {source}",
+            "category": "general",
+            "source": source,
+            "raw_confidence": 0.5,
+        }
+
+
+# ---------------------------------------------------------------------------
+# Google Vision API (card #3)
+# ---------------------------------------------------------------------------
+
+GOOGLE_VISION_URL = "https://vision.googleapis.com/v1/images:annotate"
+
+
+async def _identify_google(client: httpx.AsyncClient, api_key: str,
+                            photo_path: str, trace_id: str) -> Optional[dict]:
+    """
+    Send frame to Google Cloud Vision API.
+    Uses LABEL_DETECTION + OBJECT_LOCALIZATION + WEB_DETECTION.
+    Structures response into (name, category, confidence).
+    """
+    if not api_key:
+        logger.warning(f"[{trace_id}] Google Vision API key not configured")
+        return None
+
+    try:
+        image_bytes = pathlib.Path(photo_path).read_bytes()
+        encoded = base64.b64encode(image_bytes).decode("utf-8")
+    except Exception as e:
+        logger.error(f"[{trace_id}] Failed to read image for Google Vision: {e}")
+        return None
+
+    payload = {
+        "requests": [{
+            "image": {"content": encoded},
+            "features": [
+                {"type": "LABEL_DETECTION", "maxResults": 10},
+                {"type": "OBJECT_LOCALIZATION", "maxResults": 5},
+                {"type": "WEB_DETECTION", "maxResults": 5},
+            ],
+        }]
     }
+
+    url = f"{GOOGLE_VISION_URL}?key={api_key}"
+    logger.info(f"[{trace_id}] Calling Google Vision API...")
+
+    try:
+        resp = await client.post(url, json=payload)
+        resp.raise_for_status()
+        data = resp.json()
+    except httpx.HTTPError as e:
+        logger.error(f"[{trace_id}] Google Vision HTTP error: {e}")
+        return None
+
+    responses = data.get("responses", [])
+    if not responses:
+        logger.warning(f"[{trace_id}] Google Vision returned empty response")
+        return None
+
+    r = responses[0]
+    if "error" in r:
+        logger.error(f"[{trace_id}] Google Vision API error: {r['error']}")
+        return None
+
+    # Parse structured identity from response
+    objects = r.get("localizedObjectAnnotations", [])
+    object_name = objects[0]["name"] if objects else None
+
+    labels = r.get("labelAnnotations", [])
+    label_names = [l["description"] for l in labels[:10]] if labels else []
+
+    web = r.get("webDetection", {})
+    web_entities = web.get("webEntities", [])
+    web_entity_names = [
+        e["description"]
+        for e in web_entities[:5]
+        if "description" in e and e.get("score", 0) > 0.5
+    ] if web_entities else []
+
+    # Build descriptive name
+    material_keywords = [
+        "leather", "wood", "metal", "glass", "gold", "silver", "cotton",
+        "wool", "plastic", "oak", "mahogany", "walnut", "cherry",
+        "marble", "granite", "ceramic", "porcelain", "steel", "aluminum",
+    ]
+
+    if object_name:
+        name_parts = [object_name]
+        for label in label_names:
+            l_lower = label.lower()
+            if l_lower != object_name.lower() and l_lower not in name_parts[0].lower():
+                if any(kw in l_lower for kw in material_keywords):
+                    name_parts.insert(0, label)
+                    break
+        identified_name = " ".join(name_parts)
+    elif label_names:
+        identified_name = ", ".join(label_names[:3])
+    elif web_entity_names:
+        identified_name = web_entity_names[0]
+    else:
+        identified_name = "Unidentified item"
+
+    category = label_names[0] if label_names else "general"
+
+    if objects:
+        raw_confidence = objects[0].get("score", 0.5)
+    elif labels:
+        raw_confidence = labels[0].get("score", 0.5)
+    else:
+        raw_confidence = 0.3
+
+    logger.info(
+        f"[{trace_id}] Google Vision: \"{identified_name}\" "
+        f"(category={category}, confidence={raw_confidence:.2f})"
+    )
+
+    return {
+        "name": identified_name,
+        "category": category,
+        "source": "google",
+        "raw_confidence": raw_confidence,
+    }
+# ---------------------------------------------------------------------------
+# OpenAI GPT-4V / GPT-4o (card #4)
+# ---------------------------------------------------------------------------
+
+OPENAI_VISION_URL = "https://api.openai.com/v1/chat/completions"
+
+
+async def _identify_openai(client: httpx.AsyncClient, api_key: str,
+                            photo_path: str, trace_id: str) -> Optional[dict]:
+    """
+    Send frame to OpenAI GPT-4o for vision-based identification.
+    Returns structured JSON: {name, category, confidence}.
+    """
+    if not api_key:
+        logger.warning(f"[{trace_id}] OpenAI API key not configured")
+        return None
+
+    try:
+        image_bytes = pathlib.Path(photo_path).read_bytes()
+        encoded = base64.b64encode(image_bytes).decode("utf-8")
+    except Exception as e:
+        logger.error(f"[{trace_id}] Failed to read image for OpenAI: {e}")
+        return None
+
+    payload = {
+        "model": "gpt-4o",
+        "messages": [{
+            "role": "user",
+            "content": [
+                {
+                    "type": "text",
+                    "text": (
+                        "Identify this object precisely. Return ONLY a JSON object "
+                        "with keys: name (detailed, human-readable name including "
+                        "brand/model if visible, material, and key characteristics), "
+                        "category (one-word: furniture, jewelry, electronics, "
+                        "appliance, art, clothing, tool), "
+                        "confidence (0.0-1.0). No other text."
+                    ),
+                },
+                {
+                    "type": "image_url",
+                    "image_url": {"url": f"data:image/jpeg;base64,{encoded}"},
+                },
+            ],
+        }],
+        "max_tokens": 200,
+        "temperature": 0.0,
+    }
+
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+
+    logger.info(f"[{trace_id}] Calling OpenAI GPT-4o...")
+
+    try:
+        resp = await client.post(OPENAI_VISION_URL, json=payload, headers=headers)
+        resp.raise_for_status()
+        data = resp.json()
+    except httpx.HTTPError as e:
+        logger.error(f"[{trace_id}] OpenAI HTTP error: {e}")
+        return None
+
+    # Parse structured JSON from GPT-4o response
+    try:
+        content = data["choices"][0]["message"]["content"]
+        content = content.strip()
+        # Strip markdown code fences if present
+        if content.startswith("```"):
+            content = content.split("\n", 1)[1] if "\n" in content else content[3:]
+            if content.endswith("```"):
+                content = content[:-3]
+        result = json.loads(content.strip())
+        return {
+            "name": result.get("name", "Unknown"),
+            "category": result.get("category", "general"),
+            "source": "openai",
+            "raw_confidence": float(result.get("confidence", 0.5)),
+        }
+    except (KeyError, json.JSONDecodeError, IndexError) as e:
+        logger.error(f"[{trace_id}] Failed to parse OpenAI response: {e}")
+        return None
+
+
 
 # ---------------------------------------------------------------------------
 # Pricing — Value Estimation (card #5)
