@@ -6,11 +6,12 @@
 
 import { useRef, useState, useCallback } from 'react';
 import type { CameraState } from './useCamera';
+import { useSpeechRecognition } from './useSpeechRecognition';
 
 interface Props {
   camera: CameraState;
   onCapture: (blob: Blob, dataUrl: string) => void;
-  onSubmit: (blob: Blob) => void;
+  onSubmit: (blob: Blob, narration: string) => void;
   capturing: boolean;
 }
 
@@ -19,6 +20,7 @@ export function CameraView({ camera, onCapture, onSubmit, capturing }: Props) {
   const canvasRef   = useRef<HTMLCanvasElement>(null);
   const [previewUrl, setPreviewUrl] = useState<string | null>(null);
   const [pendingBlob, setPendingBlob] = useState<Blob | null>(null);
+  const speech = useSpeechRecognition();
 
   const { stream, devices, activeDeviceId, error, ready, switchCamera, toggleFacing } = camera;
 
@@ -54,13 +56,15 @@ export function CameraView({ camera, onCapture, onSubmit, capturing }: Props) {
   const handleRetake = useCallback(() => {
     setPreviewUrl(null);
     setPendingBlob(null);
-  }, []);
+    speech.reset();
+  }, [speech]);
 
   const handleConfirm = useCallback(() => {
     if (pendingBlob) {
-      onSubmit(pendingBlob);
+      onSubmit(pendingBlob, speech.transcript);
+      speech.reset();
     }
-  }, [pendingBlob, onSubmit]);
+  }, [pendingBlob, onSubmit, speech]);
 
   // ── Error state ──
   if (error) {
@@ -92,6 +96,40 @@ export function CameraView({ camera, onCapture, onSubmit, capturing }: Props) {
         <div className="relative w-full max-w-md rounded-lg overflow-hidden bg-black">
           <img src={previewUrl} alt="Preview" className="w-full h-auto block" />
         </div>
+
+        {/* Narration / Voice Input */}
+        {speech.supported && (
+          <div className="w-full max-w-md">
+            <div className="flex items-center gap-2 mb-2">
+              <button
+                onClick={speech.listening ? speech.stop : speech.start}
+                className={`w-10 h-10 rounded-full flex items-center justify-center
+                  transition-colors ${
+                    speech.listening
+                      ? 'bg-red-500 text-white animate-pulse'
+                      : 'bg-gray-200 text-gray-700 hover:bg-gray-300'
+                  }`}
+                title={speech.listening ? 'Stop recording' : 'Record narration'}
+              >
+                &#127908;
+              </button>
+              <span className="text-xs text-gray-500">
+                {speech.listening
+                  ? 'Listening... tap mic to stop'
+                  : 'Tap mic to describe this item'}
+              </span>
+            </div>
+            {speech.transcript && (
+              <div className="p-2 bg-yellow-50 border border-yellow-200 rounded text-sm text-gray-700 italic">
+                &ldquo;{speech.transcript}&rdquo;
+              </div>
+            )}
+            {speech.error && (
+              <p className="text-xs text-red-500 mt-1">{speech.error}</p>
+            )}
+          </div>
+        )}
+
         <div className="flex gap-3">
           <button onClick={handleRetake} disabled={capturing}
             className="px-6 py-3 bg-gray-200 text-gray-800 rounded-lg font-medium

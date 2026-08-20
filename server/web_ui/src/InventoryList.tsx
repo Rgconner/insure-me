@@ -7,6 +7,7 @@ export interface InventoryItem {
   estimated_value: number | null;
   value_source: string | null;
   confidence: number | null;
+  narration: string;
   created_at: string;
 }
 
@@ -170,6 +171,11 @@ export function InventoryList({ items, photoFilename, onRefresh }: Props) {
                         via {item.value_source}
                         {item.confidence != null &&
                           ` \u00b7 ${Math.round(item.confidence * 100)}% confidence`}</p>
+                    )}
+                    {item.narration && (
+                      <p className="text-xs text-gray-500 italic mt-1 border-l-2 border-yellow-300 pl-2">
+                        &ldquo;{item.narration}&rdquo;
+                      </p>
                     )}
                     <div className="flex gap-2 mt-3">
                       <button onClick={() => startEdit(item)}

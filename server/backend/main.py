@@ -136,6 +136,7 @@ def init_db():
             estimated_value REAL,
             value_source TEXT,
             confidence REAL,
+            narration TEXT DEFAULT '',
             created_at TEXT NOT NULL DEFAULT (datetime('now')),
             updated_at TEXT NOT NULL DEFAULT (datetime('now'))
         )
@@ -189,6 +190,7 @@ class CatalogItem(BaseModel):
     estimated_value: float
     value_source: str
     confidence: float
+    narration: str = ""
 
 # ---------------------------------------------------------------------------
 # Counters
@@ -799,12 +801,12 @@ async def add_to_inventory(item: CatalogItem):
     conn = get_db()
     conn.execute(
         """INSERT INTO inventory (id, photo_path, identified_name, category,
-           estimated_value, value_source, confidence, created_at, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+           estimated_value, value_source, confidence, narration, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             item_id, item.photo_filename, item.identified_name, item.category,
             item.estimated_value, item.value_source, item.confidence,
-            now, now,
+            item.narration, now, now,
         ),
     )
     conn.commit()

@@ -29,7 +29,7 @@ function App() {
     refreshInventory();
   }, [refreshInventory]);
 
-  const handleSubmit = useCallback(async (blob: Blob) => {
+  const handleSubmit = useCallback(async (blob: Blob, narration: string) => {
     setCapturing(true);
     setError(null);
 
