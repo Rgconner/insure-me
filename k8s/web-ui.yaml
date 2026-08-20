@@ -106,7 +106,8 @@ spec:
             name: web-ui-nginx-config
 ---
 # MetalLB LoadBalancer Service — gives the web-ui a public LAN IP.
-# Cloudflare tunnel origin: http://192.168.11.215:80 (sandbox pool).
+# Reachable directly at http://192.168.11.215:80 (sandbox pool).
+# Public access is via Traefik IngressRoute (insure-me.snwbd.com).
 apiVersion: v1
 kind: Service
 metadata:

@@ -21,7 +21,10 @@
 | web-ui (nginx SPA) | ✅ 1/1 Running — serves `http://192.168.11.215/` |
 | MetalLB LoadBalancer | ✅ `192.168.11.215` (sandbox pool) |
 | Traefik IngressRoutes | ✅ `insure-me-http` (redirect) + `insure-me-https` (letsencrypt) for `insure-me.snwbd.com` |
-| cloudflared-tunnel | ⚠️ CrashLoopBackOff — **tunnel token empty, needs Cloudflare dashboard token** |
+
+> **No per-app cloudflared tunnel.** `insure-me.snwbd.com` rides the shared
+> Traefik edge exactly like `board`/`git`/`bss.snwbd.com`. A redundant
+> cloudflared-tunnel deployment was created then removed.
 
 ### Images
 Built in-cluster with Kaniko (`k8s/kaniko-build.yaml`), pushed to internal gitea registry:
@@ -30,8 +33,8 @@ Built in-cluster with Kaniko (`k8s/kaniko-build.yaml`), pushed to internal gitea
 Pull auth via `gitea-registry` secret (copied into `insure-me` ns).
 
 ### Two remaining action items
-1. **Cloudflare tunnel token** — create the named-tunnel token for `insure-me.snwbd.com` in the Cloudflare dashboard, then:
-   `kubectl -n insure-me edit secret tunnel-token` (set `token` value) → pods auto-recover.
+1. **Cloudflare DNS/public-hostname** — add `insure-me.snwbd.com` to the existing
+   Cloudflare edge (same as board/git/bss), pointed at the Traefik edge. No new tunnel needed.
 2. **Vision/LLM API keys** — set into `insure-me-secrets` (VISION_PRIMARY_KEY, VISION_SECONDARY_KEY, SEARCH_API_KEY, LLM_API_KEY) to activate identification + pricing.
 
 ## Board

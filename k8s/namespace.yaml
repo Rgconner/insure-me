@@ -7,9 +7,12 @@
 #   kubectl apply -f k8s/backend.yaml
 #   kubectl apply -f k8s/web-ui.yaml
 #   kubectl apply -f k8s/traefik-ingressroute.yaml
-#   kubectl apply -f k8s/cloudflared-tunnel.yaml
 #   kubectl -n insure-me rollout status deployment/backend
 #   kubectl -n insure-me rollout status deployment/web-ui
+#
+# Public access is via the shared Traefik edge (insure-me.snwbd.com) —
+# no per-app cloudflared tunnel. Add the DNS/public-hostname record in
+# Cloudflare pointing at the existing edge, same as board/git/bss.snwbd.com.
 
 ---
 apiVersion: v1
