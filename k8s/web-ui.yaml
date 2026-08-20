@@ -19,6 +19,13 @@ data:
         try_files $uri $uri/ /index.html;
       }
 
+      # Never cache index.html — always fetch fresh so the browser picks up
+      # new content-hashed JS/CSS bundles on every deploy (prevents stale SPA).
+      location = /index.html {
+        add_header Cache-Control "no-store, no-cache, must-revalidate";
+        try_files $uri =404;
+      }
+
       # Backend API — proxied to the in-cluster backend ClusterIP service.
       location /api/ {
         proxy_pass http://backend.insure-me.svc.cluster.local:8000/api/;
