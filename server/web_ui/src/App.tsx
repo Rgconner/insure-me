@@ -1,20 +1,13 @@
 import { useState, useCallback, useEffect } from "react";
 import { useCamera } from "./useCamera";
 import { CameraView } from "./CameraView";
+import { InventoryList } from "./InventoryList";
+import type { InventoryItem } from "./InventoryList";
 
 interface CaptureResult {
   trace_id: string;
   photo_filename: string;
   status: string;
-}
-
-interface InventoryItem {
-  id: string;
-  identified_name: string | null;
-  estimated_value: number | null;
-  value_source: string | null;
-  confidence: number | null;
-  created_at: string;
 }
 
 function App() {
@@ -24,13 +17,17 @@ function App() {
   const [error, setError] = useState<string | null>(null);
   const [inventory, setInventory] = useState<InventoryItem[]>([]);
 
-  // Fetch inventory on mount
-  useEffect(() => {
+  const refreshInventory = useCallback(() => {
     fetch("/api/inventory")
       .then((r) => r.json())
       .then(setInventory)
       .catch(() => {});
   }, []);
+
+  // Fetch inventory on mount
+  useEffect(() => {
+    refreshInventory();
+  }, [refreshInventory]);
 
   const handleSubmit = useCallback(async (blob: Blob) => {
     setCapturing(true);
@@ -50,8 +47,7 @@ function App() {
       setLastResult(data);
 
       // Refresh inventory
-      const inv = await fetch("/api/inventory").then((r) => r.json());
-      setInventory(inv);
+      refreshInventory();
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
       setError(msg);
@@ -93,35 +89,16 @@ function App() {
           )}
         </section>
 
-        {/* Inventory — card #6 placeholder */}
+        {/* Inventory — card #6 */}
         <section className="bg-white rounded-lg shadow p-6">
           <h2 className="text-lg font-semibold mb-4">
             Inventory ({inventory.length})
           </h2>
-          {inventory.length === 0 ? (
-            <p className="text-gray-500">No items cataloged yet. Capture something above.</p>
-          ) : (
-            <div className="grid gap-3 sm:grid-cols-2">
-              {inventory.map((item) => (
-                <div key={item.id} className="border rounded-lg p-4">
-                  <p className="font-medium text-gray-900">
-                    {item.identified_name ?? "Unidentified"}
-                  </p>
-                  {item.estimated_value != null && (
-                    <p className="text-lg font-bold text-green-700">
-                      ${item.estimated_value.toLocaleString()}
-                    </p>
-                  )}
-                  {item.value_source && (
-                    <p className="text-xs text-gray-400 mt-1">
-                      Source: {item.value_source}
-                      {item.confidence != null && ` (${Math.round(item.confidence * 100)}%)`}
-                    </p>
-                  )}
-                </div>
-              ))}
-            </div>
-          )}
+          <InventoryList
+            items={inventory}
+            photoFilename={lastResult?.photo_filename ?? null}
+            onRefresh={refreshInventory}
+          />
         </section>
       </main>
     </div>

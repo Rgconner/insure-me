@@ -7,9 +7,9 @@
 ## Current State (2026-08-19 — session 1)
 
 **Branch:** `main`
-**Last commit:** `b3a0fb2` — feat(#1): Capture Frame
+**Last commit:** `89890ac` — feat(#2,#3,#4)
 **CI status:** Not yet configured
-**System state:** Cards #1-#4 complete. Camera capture → Google Vision + GPT-4o identification → cross-check. 8 cards open.
+**System state:** Cards #1-#9 complete (core pipeline + inventory CRUD + infra). 3 cards open: #10 Narration, #11 GPS Provenance, #12 Certificate Capture.
 
 ## Board
 
@@ -32,7 +32,7 @@
 
 ## Immediate First Action Next Session
 
-**→ Wire up Value Estimation (#5) — replace search_price() and llm_estimate() stubs with real web search and LLM calls.**
+**→ Add Narration / Voice Input (#10) — speech-to-text via Web Speech API to supplement visual identification.**
 
 ---
 
@@ -41,9 +41,9 @@
 | Commit | Card | What |
 |--------|------|------|
 | `b3a0fb2` | #1 | Capture Frame — camera hook + viewfinder + POST to backend |
-| (pending) | #2 | Vision Router — dispatch routing + cross-check confidence |
-| (pending) | #3 | Google Vision API — REST integration, label/object/web detection |
-| (pending) | #4 | OpenAI GPT-4o — structured JSON identification |
+| `89890ac` | #2,#3,#4 | Vision Router dispatch, Google Vision REST, OpenAI GPT-4o |
+| (pending) | #5 | Value Estimation — SerpAPI web search + OpenAI LLM fallback |
+| (pending) | #6,#7,#8,#9 | Inventory CRUD, Scaffold, Call Resilience, Redis Pub/Sub |
 
 ---
 

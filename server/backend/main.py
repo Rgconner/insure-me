@@ -25,6 +25,7 @@ import redis as redis_lib
 from fastapi import FastAPI, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 # ---------------------------------------------------------------------------
@@ -156,6 +157,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Serve uploaded photos
+app.mount("/uploads", StaticFiles(directory=str(UPLOAD_DIR)), name="uploads")
+
 # ---------------------------------------------------------------------------
 # Models
 # ---------------------------------------------------------------------------
@@ -179,6 +183,7 @@ class PriceRequest(BaseModel):
 
 class CatalogItem(BaseModel):
     trace_id: str
+    photo_filename: str = ""
     identified_name: str
     category: Optional[str] = None
     estimated_value: float
@@ -600,18 +605,163 @@ async def run_pricing(trace_id: str, identified_name: str):
                   source=SERVICE_NAME)
 
 
+# ---------------------------------------------------------------------------
+# Pricing — SerpAPI web search (card #5 — primary)
+# ---------------------------------------------------------------------------
+
+SERPAPI_URL = "https://serpapi.com/search"
+
+
 async def search_price(client: httpx.AsyncClient, item_name: str, trace_id: str) -> Optional[float]:
-    """Search web for retail price. PLACEHOLDER — real implementation in card #5."""
-    logger.info(f"[{trace_id}] Searching price for: {item_name}")
-    await asyncio.sleep(0.3)
+    """Search the web for retail/replacement price via SerpAPI."""
+    api_key = SEARCH_API_KEY
+    if not api_key:
+        logger.warning(f"[{trace_id}] SerpAPI key not configured — skipping web search")
+        return None
+
+    params = {
+        "engine": "google_shopping",
+        "q": f"{item_name} price",
+        "api_key": api_key,
+        "gl": "us",
+        "hl": "en",
+    }
+
+    logger.info(f"[{trace_id}] SerpAPI shopping: \"{item_name}\"")
+
+    try:
+        resp = await client.get(SERPAPI_URL, params=params)
+        resp.raise_for_status()
+        data = resp.json()
+    except httpx.HTTPError as e:
+        logger.warning(f"[{trace_id}] SerpAPI HTTP error: {e}")
+        return None
+
+    shopping_results = data.get("shopping_results", [])
+    if shopping_results:
+        first = shopping_results[0]
+        price = _extract_price(first.get("price"))
+        if price is not None:
+            logger.info(f"[{trace_id}] SerpAPI shopping: ${price:.2f}")
+            return price
+
+    # Fallback: regular Google search with price regex
+    params["engine"] = "google"
+    params["q"] = f"{item_name} replacement cost retail price USD"
+
+    try:
+        resp = await client.get(SERPAPI_URL, params=params)
+        resp.raise_for_status()
+        data = resp.json()
+    except httpx.HTTPError as e:
+        logger.warning(f"[{trace_id}] SerpAPI regular search error: {e}")
+        return None
+
+    kg = data.get("knowledge_graph", {})
+    price_str = kg.get("price")
+    if price_str:
+        price = _extract_price(str(price_str))
+        if price is not None:
+            logger.info(f"[{trace_id}] Knowledge graph price: ${price:.2f}")
+            return price
+
+    organic = data.get("organic_results", [])
+    for result in organic[:5]:
+        text = f"{result.get('title', '')} {result.get('snippet', '')}"
+        price = _extract_price_from_text(text)
+        if price is not None and 0.50 < price < 1_000_000:
+            logger.info(f"[{trace_id}] SerpAPI snippet price: ${price:.2f}")
+            return price
+
+    logger.info(f"[{trace_id}] SerpAPI: no price found")
     return None
 
 
+def _extract_price(raw: str | None) -> Optional[float]:
+    """Extract float from price string like '$1,299.99'."""
+    if not raw:
+        return None
+    cleaned = raw.replace("$", "").replace(",", "").replace("£", "").replace("€", "").strip()
+    try:
+        return float(cleaned)
+    except ValueError:
+        return None
+
+
+def _extract_price_from_text(text: str) -> Optional[float]:
+    """Find dollar amount in text via regex."""
+    import re
+    patterns = [
+        r'\$[\s]*([\d,]+(?:\.\d{2})?)',
+        r'([\d,]+(?:\.\d{2})?)\s*(?:USD|dollars)',
+    ]
+    for pat in patterns:
+        match = re.search(pat, text)
+        if match:
+            return _extract_price(match.group(1) if pat.startswith(r'\$') else match.group(1))
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Pricing — LLM estimate (card #5 — fallback)
+# ---------------------------------------------------------------------------
+
+LLM_API_URL = "https://api.openai.com/v1/chat/completions"
+
+
 async def llm_estimate(client: httpx.AsyncClient, item_name: str, trace_id: str) -> Optional[float]:
-    """LLM fallback for price estimation. PLACEHOLDER — real implementation in card #5."""
-    logger.info(f"[{trace_id}] LLM estimating price for: {item_name}")
-    await asyncio.sleep(0.3)
-    return 99.99
+    """Ask OpenAI to estimate replacement cost. Returns float or None."""
+    api_key = LLM_API_KEY
+    if not api_key:
+        logger.warning(f"[{trace_id}] LLM API key not configured")
+        return None
+
+    payload = {
+        "model": "gpt-4o",
+        "messages": [{
+            "role": "user",
+            "content": (
+                f"What is the current retail replacement cost of: {item_name}?\n"
+                "Return ONLY JSON: {\"estimated_value\": <float USD>, "
+                "\"confidence\": <0.0-1.0>}. No other text."
+            ),
+        }],
+        "max_tokens": 100,
+        "temperature": 0.0,
+    }
+
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+
+    logger.info(f"[{trace_id}] LLM price estimate: \"{item_name}\"")
+
+    try:
+        resp = await client.post(LLM_API_URL, json=payload, headers=headers)
+        resp.raise_for_status()
+        data = resp.json()
+    except httpx.HTTPError as e:
+        logger.error(f"[{trace_id}] LLM HTTP error: {e}")
+        return None
+
+    try:
+        content = data["choices"][0]["message"]["content"]
+        content = content.strip()
+        if content.startswith("```"):
+            content = content.split("\n", 1)[1] if "\n" in content else content[3:]
+            if content.endswith("```"):
+                content = content[:-3]
+        result = json.loads(content.strip())
+        value = result.get("estimated_value")
+        if isinstance(value, (int, float)) and value > 0:
+            conf = result.get("confidence", 0.5)
+            logger.info(f"[{trace_id}] LLM estimate: ${value:.2f} (confidence={conf:.2f})")
+            return float(value)
+    except (KeyError, json.JSONDecodeError, IndexError) as e:
+        logger.error(f"[{trace_id}] Failed to parse LLM price: {e}")
+
+    return None
 
 # ---------------------------------------------------------------------------
 # Inventory — Catalog CRUD (card #6)
@@ -652,7 +802,7 @@ async def add_to_inventory(item: CatalogItem):
            estimated_value, value_source, confidence, created_at, updated_at)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
-            item_id, "", item.identified_name, item.category,
+            item_id, item.photo_filename, item.identified_name, item.category,
             item.estimated_value, item.value_source, item.confidence,
             now, now,
         ),
