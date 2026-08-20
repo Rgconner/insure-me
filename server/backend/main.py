@@ -563,8 +563,8 @@ async def _identify_openai(client: httpx.AsyncClient, api_key: str,
                     "type": "text",
                     "text": (
                         "Identify this object precisely. Return ONLY a JSON object "
-                        "with keys: name (detailed, human-readable name including "
-                        "brand/model if visible, material, and key characteristics), "
+                        "with keys: name (a short plain-string noun phrase, e.g. "
+                        "\"Wooden Chair with Armrests\" — no nested objects), "
                         "category (one-word: furniture, jewelry, electronics, "
                         "appliance, art, clothing, tool), "
                         "confidence (0.0-1.0). No other text."
@@ -611,7 +611,13 @@ async def _identify_openai(client: httpx.AsyncClient, api_key: str,
 
         name = result.get("name", "Unknown")
         if isinstance(name, dict):
-            name = " ".join(str(v) for v in name.values() if v)
+            # Prefer a descriptive key; fall back to joining all values.
+            for key in ("detailed", "name", "description", "title", "object"):
+                if key in name and name[key]:
+                    name = str(name[key])
+                    break
+            else:
+                name = " ".join(str(v) for v in name.values() if v)
         elif isinstance(name, list):
             name = " ".join(str(v) for v in name if v)
         elif not isinstance(name, str):
