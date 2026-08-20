@@ -29,7 +29,8 @@ function App() {
     refreshInventory();
   }, [refreshInventory]);
 
-  const handleSubmit = useCallback(async (blob: Blob, narration: string) => {
+  const handleSubmit = useCallback(async (blob: Blob, narration: string,
+      lat: number | null, lng: number | null) => {
     setCapturing(true);
     setError(null);
 

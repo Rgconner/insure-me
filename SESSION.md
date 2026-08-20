@@ -7,9 +7,9 @@
 ## Current State (2026-08-19 — session 1)
 
 **Branch:** `main`
-**Last commit:** `89890ac` — feat(#2,#3,#4)
+**Last commit:** `b1e650a` — feat(#10): Voice Narration
 **CI status:** Not yet configured
-**System state:** Cards #1-#9 complete (core pipeline + inventory CRUD + infra). 3 cards open: #10 Narration, #11 GPS Provenance, #12 Certificate Capture.
+**System state:** ALL 12 CARDS COMPLETE. Prototype scaffolded with full pipeline: capture → dual-source vision → pricing → catalog CRUD with voice narration, GPS, and document attachments.
 
 ## Board
 
@@ -32,7 +32,7 @@
 
 ## Immediate First Action Next Session
 
-**→ Add Narration / Voice Input (#10) — speech-to-text via Web Speech API to supplement visual identification.**
+**→ CI/CD pipeline + deploy (#7 infra). Then integrate real API keys and test the full pipeline end-to-end.**
 
 ---
 
@@ -42,8 +42,9 @@
 |--------|------|------|
 | `b3a0fb2` | #1 | Capture Frame — camera hook + viewfinder + POST to backend |
 | `89890ac` | #2,#3,#4 | Vision Router dispatch, Google Vision REST, OpenAI GPT-4o |
-| (pending) | #5 | Value Estimation — SerpAPI web search + OpenAI LLM fallback |
-| (pending) | #6,#7,#8,#9 | Inventory CRUD, Scaffold, Call Resilience, Redis Pub/Sub |
+| `42e2bc7` | #5,#6 | Value Estimation (SerpAPI + LLM) + Inventory CRUD with photos |
+| `b1e650a` | #10 | Voice Narration — SpeechRecognition API |
+| (pending) | #11,#12 | GPS Provenance + Certificate Document Capture |
 
 ---
 

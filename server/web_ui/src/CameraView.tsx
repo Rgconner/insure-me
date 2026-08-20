@@ -8,10 +8,10 @@ import { useRef, useState, useCallback } from 'react';
 import type { CameraState } from './useCamera';
 import { useSpeechRecognition } from './useSpeechRecognition';
 
-interface Props {
+export interface Props {
   camera: CameraState;
   onCapture: (blob: Blob, dataUrl: string) => void;
-  onSubmit: (blob: Blob, narration: string) => void;
+  onSubmit: (blob: Blob, narration: string, lat: number | null, lng: number | null) => void;
   capturing: boolean;
 }
 
@@ -20,6 +20,7 @@ export function CameraView({ camera, onCapture, onSubmit, capturing }: Props) {
   const canvasRef   = useRef<HTMLCanvasElement>(null);
   const [previewUrl, setPreviewUrl] = useState<string | null>(null);
   const [pendingBlob, setPendingBlob] = useState<Blob | null>(null);
+  const [gps, setGps] = useState<{ lat: number; lng: number } | null>(null);
   const speech = useSpeechRecognition();
 
   const { stream, devices, activeDeviceId, error, ready, switchCamera, toggleFacing } = camera;
@@ -51,20 +52,31 @@ export function CameraView({ camera, onCapture, onSubmit, capturing }: Props) {
         onCapture(blob, dataUrl);
       }
     }, 'image/jpeg', 0.92);
+
+    // Capture GPS at photo time
+    if (navigator.geolocation) {
+      navigator.geolocation.getCurrentPosition(
+        (pos) => setGps({ lat: pos.coords.latitude, lng: pos.coords.longitude }),
+        () => setGps(null),  // denied or unavailable — gracefully skip
+        { timeout: 5000, maximumAge: 60000 }
+      );
+    }
   }, [onCapture]);
 
   const handleRetake = useCallback(() => {
     setPreviewUrl(null);
     setPendingBlob(null);
+    setGps(null);
     speech.reset();
   }, [speech]);
 
   const handleConfirm = useCallback(() => {
     if (pendingBlob) {
-      onSubmit(pendingBlob, speech.transcript);
+      onSubmit(pendingBlob, speech.transcript, gps?.lat ?? null, gps?.lng ?? null);
       speech.reset();
+      setGps(null);
     }
-  }, [pendingBlob, onSubmit, speech]);
+  }, [pendingBlob, onSubmit, speech, gps]);
 
   // ── Error state ──
   if (error) {
@@ -126,6 +138,11 @@ export function CameraView({ camera, onCapture, onSubmit, capturing }: Props) {
             )}
             {speech.error && (
               <p className="text-xs text-red-500 mt-1">{speech.error}</p>
+            )}
+            {gps && (
+              <p className="text-xs text-green-600 mt-1">
+                &#128205; Location captured ({gps.lat.toFixed(4)}, {gps.lng.toFixed(4)})
+              </p>
             )}
           </div>
         )}

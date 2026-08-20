@@ -137,8 +137,21 @@ def init_db():
             value_source TEXT,
             confidence REAL,
             narration TEXT DEFAULT '',
+            latitude REAL,
+            longitude REAL,
+            captured_at TEXT,
             created_at TEXT NOT NULL DEFAULT (datetime('now')),
             updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS documents (
+            id TEXT PRIMARY KEY,
+            inventory_id TEXT NOT NULL,
+            photo_path TEXT NOT NULL,
+            doc_type TEXT DEFAULT 'other',
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            FOREIGN KEY (inventory_id) REFERENCES inventory(id)
         )
     """)
     conn.commit()
@@ -191,6 +204,9 @@ class CatalogItem(BaseModel):
     value_source: str
     confidence: float
     narration: str = ""
+    latitude: float | None = None
+    longitude: float | None = None
+    captured_at: str = ""
 
 # ---------------------------------------------------------------------------
 # Counters
@@ -801,12 +817,15 @@ async def add_to_inventory(item: CatalogItem):
     conn = get_db()
     conn.execute(
         """INSERT INTO inventory (id, photo_path, identified_name, category,
-           estimated_value, value_source, confidence, narration, created_at, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+           estimated_value, value_source, confidence, narration,
+           latitude, longitude, captured_at, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             item_id, item.photo_filename, item.identified_name, item.category,
             item.estimated_value, item.value_source, item.confidence,
-            item.narration, now, now,
+            item.narration,
+            item.latitude, item.longitude, item.captured_at,
+            now, now,
         ),
     )
     conn.commit()
@@ -870,6 +889,82 @@ async def delete_inventory_item(item_id: str):
 
 
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Documents — Certificate / Appraisal capture (card #12)
+# ---------------------------------------------------------------------------
+
+class DocumentUpload(BaseModel):
+    doc_type: str = "other"  # certificate, appraisal, receipt, other
+
+
+@app.post("/api/inventory/{item_id}/documents")
+async def add_document(item_id: str, file: UploadFile):
+    """Upload a supporting document photo for an inventory item."""
+    conn = get_db()
+    existing = conn.execute("SELECT * FROM inventory WHERE id = ?", (item_id,)).fetchone()
+    if not existing:
+        conn.close()
+        raise HTTPException(status_code=404, detail="Item not found")
+
+    doc_id = str(uuid.uuid4())
+    ext = pathlib.Path(file.filename).suffix if file.filename else ".jpg"
+    doc_filename = f"doc-{doc_id}{ext}"
+    doc_path = UPLOAD_DIR / doc_filename
+
+    content = await file.read()
+    doc_path.write_bytes(content)
+
+    # Determine doc_type from query param or default
+    doc_type = "other"
+
+    conn.execute(
+        """INSERT INTO documents (id, inventory_id, photo_path, doc_type)
+           VALUES (?, ?, ?, ?)""",
+        (doc_id, item_id, doc_filename, doc_type),
+    )
+    conn.commit()
+
+    row = conn.execute("SELECT * FROM documents WHERE id = ?", (doc_id,)).fetchone()
+    conn.close()
+
+    return dict(row)
+
+
+@app.get("/api/inventory/{item_id}/documents")
+async def list_documents(item_id: str):
+    """List all supporting documents for an inventory item."""
+    conn = get_db()
+    rows = conn.execute(
+        "SELECT * FROM documents WHERE inventory_id = ? ORDER BY created_at DESC",
+        (item_id,),
+    ).fetchall()
+    conn.close()
+    return [dict(row) for row in rows]
+
+
+@app.delete("/api/documents/{doc_id}")
+async def delete_document(doc_id: str):
+    """Remove a supporting document."""
+    conn = get_db()
+    existing = conn.execute("SELECT * FROM documents WHERE id = ?", (doc_id,)).fetchone()
+    if not existing:
+        conn.close()
+        raise HTTPException(status_code=404, detail="Document not found")
+
+    # Delete the file
+    doc_path = UPLOAD_DIR / existing["photo_path"]
+    try:
+        doc_path.unlink(missing_ok=True)
+    except Exception:
+        pass
+
+    conn.execute("DELETE FROM documents WHERE id = ?", (doc_id,))
+    conn.commit()
+    conn.close()
+    return {"status": "deleted", "id": doc_id}
+
+
+
 # Debug endpoints
 # ---------------------------------------------------------------------------
 

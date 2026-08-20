@@ -8,6 +8,17 @@ export interface InventoryItem {
   value_source: string | null;
   confidence: number | null;
   narration: string;
+  latitude: number | null;
+  longitude: number | null;
+  captured_at: string;
+  created_at: string;
+}
+
+interface DocItem {
+  id: string;
+  inventory_id: string;
+  photo_path: string;
+  doc_type: string;
   created_at: string;
 }
 
@@ -26,6 +37,39 @@ export function InventoryList({ items, photoFilename, onRefresh }: Props) {
   const [newValue, setNewValue] = useState('');
   const [editName, setEditName] = useState('');
   const [editValue, setEditValue] = useState('');
+  const [expandedDocs, setExpandedDocs] = useState<string | null>(null);
+  const [documents, setDocuments] = useState<Record<string, DocItem[]>>({});
+
+  const fetchDocs = useCallback(async (itemId: string) => {
+    try {
+      const res = await fetch(`/api/inventory/${itemId}/documents`);
+      if (res.ok) {
+        const docs: DocItem[] = await res.json();
+        setDocuments((prev) => ({ ...prev, [itemId]: docs }));
+      }
+    } catch { /* ignore */ }
+  }, []);
+
+  const handleDocUpload = useCallback(async (itemId: string, file: File) => {
+    setAdding(true);
+    try {
+      const form = new FormData();
+      form.append('file', file);
+      await fetch(`/api/inventory/${itemId}/documents`, { method: 'POST', body: form });
+      await fetchDocs(itemId);
+    } catch (err: unknown) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally { setAdding(false); }
+  }, [fetchDocs]);
+
+  const handleDocDelete = useCallback(async (docId: string, itemId: string) => {
+    try {
+      await fetch(`/api/documents/${docId}`, { method: 'DELETE' });
+      await fetchDocs(itemId);
+    } catch (err: unknown) {
+      setError(err instanceof Error ? err.message : String(err));
+    }
+  }, [fetchDocs]);
 
   const handleAdd = useCallback(async () => {
     if (!newName.trim()) return;
@@ -177,6 +221,57 @@ export function InventoryList({ items, photoFilename, onRefresh }: Props) {
                         &ldquo;{item.narration}&rdquo;
                       </p>
                     )}
+                    {(item.latitude != null && item.longitude != null) && (
+                      <p className="text-xs text-gray-400 mt-1">
+                        &#128205; {item.latitude.toFixed(4)}, {item.longitude.toFixed(4)}
+                        {item.captured_at && ` · ${item.captured_at}`}
+                      </p>
+                    )}
+                    {/* Documents gallery */}
+                    <div className="mt-2 pt-2 border-t border-gray-100">
+                      <button
+                        onClick={() => {
+                          if (expandedDocs === item.id) {
+                            setExpandedDocs(null);
+                          } else {
+                            setExpandedDocs(item.id);
+                            fetchDocs(item.id);
+                          }
+                        }}
+                        className="text-xs text-blue-600 hover:underline"
+                      >
+                        &#128206; Documents ({documents[item.id]?.length ?? '...'})
+                      </button>
+                      {expandedDocs === item.id && (
+                        <div className="mt-2 space-y-2">
+                          {documents[item.id]?.map((doc) => (
+                            <div key={doc.id} className="flex items-start gap-2">
+                              <img src={`/uploads/${doc.photo_path}`}
+                                alt={doc.doc_type}
+                                className="w-16 h-12 object-cover rounded border" />
+                              <div className="flex-1 min-w-0">
+                                <p className="text-xs text-gray-600 capitalize">{doc.doc_type}</p>
+                                <button
+                                  onClick={() => handleDocDelete(doc.id, item.id)}
+                                  className="text-xs text-red-500 hover:underline mt-1">
+                                  Remove
+                                </button>
+                              </div>
+                            </div>
+                          ))}
+                          <label className="inline-block px-3 py-1 bg-gray-100 text-xs
+                            text-gray-700 rounded cursor-pointer hover:bg-gray-200">
+                            + Add Photo
+                            <input type="file" accept="image/*" className="hidden"
+                              onChange={(e) => {
+                                const f = e.target.files?.[0];
+                                if (f) handleDocUpload(item.id, f);
+                                e.target.value = '';
+                              }} />
+                          </label>
+                        </div>
+                      )}
+                    </div>
                     <div className="flex gap-2 mt-3">
                       <button onClick={() => startEdit(item)}
                         className="text-xs text-blue-600 hover:underline">Edit</button>
