@@ -1,0 +1,62 @@
+---
+# Cloudflare Tunnel — named connector for insure-me.snwbd.com.
+# Mirrors the elite-powerplay cloudflared deployment pattern.
+#
+# IMPORTANT: set the actual tunnel token into the tunnel-token secret
+# (created in the Cloudflare dashboard for the insure-me.snwbd.com hostname)
+# before the pod will establish the connection:
+#   kubectl -n insure-me edit secret tunnel-token
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cloudflared-tunnel
+  namespace: insure-me
+  labels:
+    pod: cloudflared
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      pod: cloudflared
+  template:
+    metadata:
+      labels:
+        pod: cloudflared
+    spec:
+      containers:
+        - name: cloudflared
+          image: cloudflare/cloudflared:latest
+          imagePullPolicy: Always
+          command:
+            - cloudflared
+            - tunnel
+            - --no-autoupdate
+            - --loglevel
+            - info
+            - --metrics
+            - 0.0.0.0:2000
+            - run
+          env:
+            - name: TUNNEL_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: tunnel-token
+                  key: token
+          livenessProbe:
+            httpGet:
+              path: /ready
+              port: 2000
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            failureThreshold: 1
+          resources: {}
+---
+# Cloudflare tunnel token secret (Opaque).
+# Set the `token` field to the named-tunnel token for insure-me.snwbd.com.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: tunnel-token
+  namespace: insure-me
+stringData:
+  token: ""

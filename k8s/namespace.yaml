@@ -1,0 +1,20 @@
+---
+# insure-me k8s manifests
+#
+# Apply order:
+#   kubectl apply -f k8s/namespace.yaml
+#   kubectl apply -f k8s/redis.yaml
+#   kubectl apply -f k8s/backend.yaml
+#   kubectl apply -f k8s/web-ui.yaml
+#   kubectl apply -f k8s/traefik-ingressroute.yaml
+#   kubectl apply -f k8s/cloudflared-tunnel.yaml
+#   kubectl -n insure-me rollout status deployment/backend
+#   kubectl -n insure-me rollout status deployment/web-ui
+
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: insure-me
+  labels:
+    app.kubernetes.io/part-of: insure-me

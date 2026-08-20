@@ -1,0 +1,129 @@
+---
+# Backend config — env vars for the FastAPI service.
+# API keys are NOT stored here; they should be supplied via an
+# insure-me-secrets Secret (see SESSION/notes) so nothing secret leaks into git.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: insure-me-config
+  namespace: insure-me
+data:
+  REDIS_URL: "redis://redis:6379"
+  DATABASE_URL: "sqlite:////data/insure-me.db"
+  UPLOAD_DIR: "/data/uploads"
+  VISION_PRIMARY: "google"
+  VISION_SECONDARY: "openai"
+  EXTERNAL_TIMEOUT_SECONDS: "15"
+  SERVICE_VERSION: "0.1.0"
+---
+# Persistent volume for SQLite DB + uploaded photos.
+# Survives pod restarts so the inventory catalog persists.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: insure-me-data
+  namespace: insure-me
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 2Gi
+---
+# Backend deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: backend
+  namespace: insure-me
+  labels:
+    app: backend
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: backend
+  template:
+    metadata:
+      labels:
+        app: backend
+    spec:
+      imagePullSecrets:
+        - name: gitea-registry
+      containers:
+        - name: backend
+          image: git.snwbd.com/aikb-admin/insure-me/backend:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8000
+              name: http
+          envFrom:
+            - configMapRef:
+                name: insure-me-config
+          env:
+            - name: VISION_PRIMARY_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: insure-me-secrets
+                  key: VISION_PRIMARY_KEY
+                  optional: true
+            - name: VISION_SECONDARY_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: insure-me-secrets
+                  key: VISION_SECONDARY_KEY
+                  optional: true
+            - name: SEARCH_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: insure-me-secrets
+                  key: SEARCH_API_KEY
+                  optional: true
+            - name: LLM_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: insure-me-secrets
+                  key: LLM_API_KEY
+                  optional: true
+          volumeMounts:
+            - name: data
+              mountPath: /data
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 15
+            periodSeconds: 30
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: insure-me-data
+---
+# ClusterIP Service (internal — web-ui proxies /api to this)
+apiVersion: v1
+kind: Service
+metadata:
+  name: backend
+  namespace: insure-me
+  labels:
+    app: backend
+spec:
+  selector:
+    app: backend
+  ports:
+    - name: http
+      port: 8000
+      targetPort: 8000

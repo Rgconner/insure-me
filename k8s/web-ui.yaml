@@ -1,0 +1,126 @@
+---
+# web-ui nginx config — SPA + proxy /api and /uploads to the backend service.
+# Namespace-qualified FQDN is required across namespaces (backend.insure-me...).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: web-ui-nginx-config
+  namespace: insure-me
+data:
+  default.conf: |
+    server {
+      listen 80;
+      server_name _;
+
+      root /usr/share/nginx/html;
+      index index.html;
+
+      location / {
+        try_files $uri $uri/ /index.html;
+      }
+
+      # Backend API — proxied to the in-cluster backend ClusterIP service.
+      location /api/ {
+        proxy_pass http://backend.insure-me.svc.cluster.local:8000/api/;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_connect_timeout 5s;
+        proxy_read_timeout 60s;
+        client_max_body_size 12m;
+      }
+
+      # Uploaded photos (capture frames + documents) served from the backend.
+      location /uploads/ {
+        proxy_pass http://backend.insure-me.svc.cluster.local:8000/uploads/;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_connect_timeout 5s;
+        proxy_read_timeout 60s;
+      }
+
+      # Health
+      location = /health {
+        proxy_pass http://backend.insure-me.svc.cluster.local:8000/health;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_connect_timeout 5s;
+      }
+    }
+---
+# web-ui deployment — serves the React SPA, proxies API to backend.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web-ui
+  namespace: insure-me
+  labels:
+    app: web-ui
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: web-ui
+  template:
+    metadata:
+      labels:
+        app: web-ui
+    spec:
+      imagePullSecrets:
+        - name: gitea-registry
+      containers:
+        - name: web-ui
+          image: git.snwbd.com/aikb-admin/insure-me/web-ui:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 80
+              name: http
+          volumeMounts:
+            - name: nginx-config
+              mountPath: /etc/nginx/conf.d/default.conf
+              subPath: default.conf
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 200m
+              memory: 128Mi
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 80
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /
+              port: 80
+            initialDelaySeconds: 10
+            periodSeconds: 15
+      volumes:
+        - name: nginx-config
+          configMap:
+            name: web-ui-nginx-config
+---
+# MetalLB LoadBalancer Service — gives the web-ui a public LAN IP.
+# Cloudflare tunnel origin: http://192.168.11.215:80 (sandbox pool).
+apiVersion: v1
+kind: Service
+metadata:
+  name: web-ui
+  namespace: insure-me
+  annotations:
+    metallb.universe.tf/loadBalancerIPs: 192.168.11.215
+    metallb.universe.tf/address-pool: sandbox
+spec:
+  type: LoadBalancer
+  selector:
+    app: web-ui
+  ports:
+    - name: http
+      port: 80
+      targetPort: 80
+      protocol: TCP

@@ -1,0 +1,95 @@
+---
+# Kaniko build job — clones RgConner/insure-me from GitHub, builds backend + web-ui,
+# pushes to the internal gitea registry (git.snwbd.com/aikb-admin/insure-me/*).
+#
+# Run:
+#   kubectl -n insure-me delete job insure-me-build --ignore-not-found
+#   kubectl apply -f k8s/kaniko-build.yaml
+#   kubectl -n insure-me logs -f job/insure-me-build
+#   kubectl -n insure-me rollout restart deployment/backend
+#   kubectl -n insure-me rollout restart deployment/web-ui
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: insure-me-build
+  namespace: insure-me
+spec:
+  ttlSecondsAfterFinished: 3600
+  backoffLimit: 0
+  template:
+    spec:
+      restartPolicy: Never
+      initContainers:
+        - name: git-clone
+          image: alpine/git:latest
+          command: ["sh", "-c"]
+          args:
+            - >-
+              git clone --depth=1
+              https://oauth2:${GITHUB_TOKEN}@github.com/Rgconner/insure-me.git /workspace
+              && echo 'Clone OK' && ls /workspace
+          volumeMounts:
+            - name: workspace
+              mountPath: /workspace
+          env:
+            - name: GITHUB_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: insure-me-secrets
+                  key: GITHUB_TOKEN
+      containers:
+        - name: kaniko-backend
+          image: gcr.io/kaniko-project/executor:latest
+          args:
+            - --context=dir:///workspace/server/backend
+            - --dockerfile=/workspace/server/backend/Dockerfile
+            - --destination=git.snwbd.com/aikb-admin/insure-me/backend:latest
+            - --cache=true
+            - --cache-repo=git.snwbd.com/aikb-admin/insure-me/cache-backend
+            - --cache-run-layers=true
+            - --cache-copy-layers=false
+          volumeMounts:
+            - name: workspace
+              mountPath: /workspace
+            - name: docker-config
+              mountPath: /kaniko/.docker
+          resources:
+            requests:
+              cpu: 500m
+              memory: 1Gi
+            limits:
+              cpu: 2000m
+              memory: 3Gi
+        - name: kaniko-web-ui
+          image: gcr.io/kaniko-project/executor:latest
+          args:
+            - --context=dir:///workspace/server/web_ui
+            - --dockerfile=/workspace/server/web_ui/Dockerfile
+            - --destination=git.snwbd.com/aikb-admin/insure-me/web-ui:latest
+            - --cache=true
+            - --cache-repo=git.snwbd.com/aikb-admin/insure-me/cache-web-ui
+            - --cache-run-layers=true
+            - --cache-copy-layers=false
+          volumeMounts:
+            - name: workspace
+              mountPath: /workspace
+            - name: docker-config
+              mountPath: /kaniko/.docker
+          resources:
+            requests:
+              cpu: 500m
+              memory: 1Gi
+            limits:
+              cpu: 2000m
+              memory: 3Gi
+      volumes:
+        - name: workspace
+          emptyDir: {}
+        - name: docker-config
+          projected:
+            sources:
+              - secret:
+                  name: gitea-registry
+                  items:
+                    - key: .dockerconfigjson
+                      path: config.json

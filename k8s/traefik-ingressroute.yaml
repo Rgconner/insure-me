@@ -1,0 +1,38 @@
+---
+# HTTP -> HTTPS redirect for insure-me.snwbd.com
+apiVersion: traefik.io/v1alpha1
+kind: IngressRoute
+metadata:
+  name: insure-me-http
+  namespace: insure-me
+spec:
+  entryPoints:
+    - web
+  routes:
+    - kind: Rule
+      match: Host(`insure-me.snwbd.com`)
+      middlewares:
+        - name: redirect-https
+          namespace: aikb
+      services:
+        - name: web-ui
+          port: 80
+
+---
+# HTTPS — TLS terminated at Traefik with letsencrypt, routed to web-ui.
+apiVersion: traefik.io/v1alpha1
+kind: IngressRoute
+metadata:
+  name: insure-me-https
+  namespace: insure-me
+spec:
+  entryPoints:
+    - websecure
+  routes:
+    - kind: Rule
+      match: Host(`insure-me.snwbd.com`)
+      services:
+        - name: web-ui
+          port: 80
+  tls:
+    certResolver: letsencrypt
