@@ -4,12 +4,13 @@
 
 ---
 
-## Current State (2026-08-20 — session 2, rebuild done)
+## Current State (2026-08-20 — session 2, phase 2 cards locked)
 
 **Branch:** `main`
-**Last commit:** `1d0d93a` — fix: no-store cache header for index.html (stale SPA bundle)
-**Pods:** 3/3 healthy (rebuilt 1 min ago). web-ui HTTP 200, inventory 4 items.
-**Cloudflare:** **External to this NS.** No cloudflared tunnel in `insure-me` — tunnel is shared infrastructure. Do NOT recreate or debug it here.
+**Last commit:** `ab50e00` — session: rebuild complete, cloudflare note
+**Pods:** 3/3 healthy. web-ui HTTP 200, inventory 4 items.
+**Board:** 10 new cards (#13–#22) — Policy & Coverage Phase.
+**Next:** Start on #13 (Archive Items).
 
 ### Deployment status (cluster `192.168.10.101`)
 
@@ -39,26 +40,24 @@ Pull auth via `gitea-registry` secret (copied into `insure-me` ns).
 
 ## Board
 
-[insure-me issues](https://github.com/Rgconner/insure-me/issues) — 12 open cards
+[insure-me issues](https://github.com/Rgconner/insure-me/issues) — 10 open cards (#13–#22)
 
-| # | Card |
-|---|------|
-| 1 | Capture Frame |
-| 2 | Vision Router — Primary + Secondary Cross-Check |
-| 3 | Vision Source A — Google Vision API |
-| 4 | Vision Source B — Alternate Vision API |
-| 5 | Value Estimation — Web Search + LLM Fallback |
-| 6 | Inventory Builder — Catalog CRUD |
-| 7 | Repo & Project Scaffold |
-| 8 | External Call Resilience — Timeouts + Error Handling |
-| 9 | Message Tracking — Redis Pub/Sub Pipeline |
-| 10 | Narration / Voice Input — Speak Item Details |
-| 11 | GPS + Timestamp Provenance |
-| 12 | Certificate of Authentication Capture |
+| # | Card | Category |
+|---|------|----------|
+| 13 | Archive Items (soft-delete) | Inventory |
+| 14 | Policy Upload — PDF / URL / Text | Policy |
+| 15 | Policy Parsing (LLM) | Policy |
+| 16 | Policy Storage — Database and CRUD | Policy |
+| 17 | Policy Review and Edit | Policy |
+| 18 | Coverage Comparison Engine | Coverage |
+| 19 | Coverage Flags and Colors | Coverage |
+| 20 | Comparison Dashboard | Coverage |
+| 21 | Cross-Policy Analysis | Coverage |
+| 22 | Category Mapping — Items to Policy Sub-Limits | Coverage |
 
 ## Immediate First Action Next Session
 
-**→ CI/CD pipeline + deploy (#7 infra). Then integrate real API keys and test the full pipeline end-to-end.**
+**→ Start on #13: Archive Items — add `archived` column, archive/restore endpoints, archive button in InventoryList.**
 
 ---
 
