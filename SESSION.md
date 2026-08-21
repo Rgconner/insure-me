@@ -4,12 +4,12 @@
 
 ---
 
-## Current State (2026-08-20 — session 1, deployed)
+## Current State (2026-08-20 — session 2, rebuild done)
 
 **Branch:** `main`
-**Last commit:** `d7b8fed` — deploy: Recreate strategy for backend (RWO PVC multi-attach fix)
-**CI status:** Not applicable — images built in-cluster via Kaniko → `git.snwbd.com/aikb-admin/insure-me/*`
-**System state:** ALL 12 CARDS COMPLETE + **deployed to k8s** in own `insure-me` namespace.
+**Last commit:** `1d0d93a` — fix: no-store cache header for index.html (stale SPA bundle)
+**Pods:** 3/3 healthy (rebuilt 1 min ago). web-ui HTTP 200, inventory 4 items.
+**Cloudflare:** **External to this NS.** No cloudflared tunnel in `insure-me` — tunnel is shared infrastructure. Do NOT recreate or debug it here.
 
 ### Deployment status (cluster `192.168.10.101`)
 
