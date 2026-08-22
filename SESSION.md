@@ -4,13 +4,13 @@
 
 ---
 
-## Current State (2026-08-20 — session 2, phase 2 cards locked)
+## Current State (2026-08-20 — session 2, phase 2 complete)
 
 **Branch:** `main`
-**Last commit:** `ab50e00` — session: rebuild complete, cloudflare note
+**Last commit:** `d1ef931` — feat(#18-#22): Coverage comparison engine and dashboard
 **Pods:** 3/3 healthy. web-ui HTTP 200, inventory 4 items.
-**Board:** 10 new cards (#13–#22) — Policy & Coverage Phase.
-**Next:** Start on #13 (Archive Items).
+**Board:** ALL 22 CARDS COMPLETE. Archive + Policy upload/parse/review/storage + Coverage comparison/dashboard/flags/mapping/cross-policy.
+**Next:** Rebuild + deploy to pick up phase 2.
 
 ### Deployment status (cluster `192.168.10.101`)
 
@@ -69,7 +69,11 @@ Pull auth via `gitea-registry` secret (copied into `insure-me` ns).
 | `89890ac` | #2,#3,#4 | Vision Router dispatch, Google Vision REST, OpenAI GPT-4o |
 | `42e2bc7` | #5,#6 | Value Estimation (SerpAPI + LLM) + Inventory CRUD with photos |
 | `b1e650a` | #10 | Voice Narration — SpeechRecognition API |
-| (pending) | #11,#12 | GPS Provenance + Certificate Document Capture |
+| `5513233` | #11,#12 | GPS Provenance + Certificate Document Capture |
+| `0e2bab7` | deploy | k8s manifests (namespace, redis, backend, web-ui, traefik, kaniko) |
+| `e2701de` | #13 | Archive Items — soft-delete with archive/restore |
+| `382a6e1` | #14-#17 | Policy upload, LLM parse, storage, review/edit |
+| `d1ef931` | #18-#22 | Coverage comparison engine, dashboard, flags, category mapping |
 
 ---
 
