@@ -1496,8 +1496,169 @@ async def debug_channel(channel: str, limit: int = 10):
     return {
         "channel": channel,
         "note": "Use redis-cli MONITOR to inspect live pub/sub traffic.",
+# ---------------------------------------------------------------------------
+# Category Mapping — Items to Policy Sub-Limits (card #22)
+# ---------------------------------------------------------------------------
+
+CATEGORY_KEYWORDS: dict[str, list[str]] = {
+    "jewelry": ["jewelry", "ring", "necklace", "bracelet", "watch", "gold",
+                "diamond", "gem", "silver", "pendant", "earring"],
+    "electronics": ["laptop", "computer", "tablet", "phone", "tv", "television",
+                    "camera", "speaker", "headphone", "electronics", "monitor",
+                    "printer", "gaming", "console"],
+    "art": ["painting", "art", "sculpture", "canvas", "watercolor", "print",
+            "portrait", "framed", "drawing"],
+    "cash": ["cash", "currency", "coin", "money"],
+    "firearms": ["firearm", "gun", "rifle", "pistol", "shotgun", "revolver"],
+    "household_goods": ["furniture", "couch", "sofa", "chair", "table", "desk",
+                        "bed", "dresser", "bookshelf", "mattress", "cabinet",
+                        "rug", "carpet", "lamp", "mirror", "curtain", "appliance"],
+    "tools": ["tool", "power", "saw", "drill", "hammer", "wrench", "screwdriver"],
+    "clothing": ["clothing", "shirt", "jacket", "coat", "dress", "shoes", "boots",
+                 "pants", "jeans", "sweater", "suit", "hat"],
+}
+
+
+def map_category_to_policy_category(name: str | None, category: str | None,
+                                      category_override: str | None = None) -> str:
+    """Map an item's identity/category to a policy sub-limit category via keywords."""
+    if category_override:
+        return category_override.lower()
+    search = ((name or "") + " " + (category or "")).lower()
+    for policy_cat, keywords in CATEGORY_KEYWORDS.items():
+        for kw in keywords:
+            if kw in search:
+                return policy_cat
+    return "other"
     }
 
+# ---------------------------------------------------------------------------
+# Coverage Comparison Engine (cards #18-#21)
+# ---------------------------------------------------------------------------
+
+@app.post("/api/compare-coverage")
+async def compare_coverage_all():
+    """Run comparison against active policy. Includes cross-policy check (card #21)."""
+    conn = get_db()
+    active = conn.execute(
+        "SELECT * FROM policies WHERE active = 1 ORDER BY created_at DESC LIMIT 1"
+    ).fetchone()
+    if not active:
+        conn.close()
+        raise HTTPException(status_code=404, detail="No active policy")
+    pid = active["id"]
+    conn.close()
+    result = await _run_comparison(pid)
+
+    # Cross-policy: see if other policies cover gaps
+    conn2 = get_db()
+    others = conn2.execute("SELECT * FROM policies WHERE id != ?", (pid,)).fetchall()
+    conn2.close()
+    if others:
+        xrefs: list[dict] = []
+        for item in result["items"]:
+            if item["coverage_status"] in ("coverage_gap", "not_covered"):
+                mc = item.get("mapped_category", "")
+                for op in others:
+                    c3 = get_db()
+                    ops = c3.execute(
+                        "SELECT * FROM policy_sub_limits WHERE policy_id=? AND category=?",
+                        (op["id"], mc)).fetchall()
+                    c3.close()
+                    for s in ops:
+                        if not s["exclusion"] and (s["limit_amount"] or 0) > 0:
+                            xrefs.append({
+                                "item_id": item["id"], "item_name": item["identified_name"],
+                                "gap_category": mc, "alternate_policy": op["name"],
+async def _run_comparison(policy_id: str) -> dict:
+    """Core comparison — categorizes items, checks limits, stores per-item results."""
+    conn = get_db()
+    policy = conn.execute("SELECT * FROM policies WHERE id = ?", (policy_id,)).fetchone()
+    if not policy:
+        conn.close()
+        return {"error": "Policy not found"}
+    subs = conn.execute("SELECT * FROM policy_sub_limits WHERE policy_id = ?", (policy_id,)).fetchall()
+    items = conn.execute("SELECT * FROM inventory WHERE archived = 0 ORDER BY created_at DESC").fetchall()
+
+    limits: dict[str, dict] = {}
+    for sl in subs:
+        limits[sl["category"].lower()] = {
+            "limit_amount": sl["limit_amount"], "exclusion": bool(sl["exclusion"]),
+            "description": sl["description"],
+        }
+    overall = float(policy["overall_limit"] or 0)
+    total_val = 0.0
+    cat_tots: dict[str, float] = {}
+    results: list[dict] = []
+
+    for item in items:
+        d = dict(item)
+        v = float(d["estimated_value"] or 0)
+        total_val += v
+        mapped = map_category_to_policy_category(d["identified_name"], d["category"], d["category_override"])
+        d["mapped_category"] = mapped
+
+        if mapped in limits and limits[mapped]["exclusion"]:
+            st, g = "not_covered", v
+            det = f"Category '{mapped}' is explicitly excluded"
+        elif mapped in limits:
+            ct = cat_tots.get(mapped, 0) + v
+            cat_tots[mapped] = ct
+            lim = limits[mapped]["limit_amount"]
+            if v > lim:
+                st, g = "coverage_gap", v - lim
+                det = f"Exceeds {mapped} sub-limit of ${lim:,.2f} by ${g:,.2f}"
+            else:
+                st, g = "covered", 0
+                det = f"Within {mapped} sub-limit of ${lim:,.2f}"
+        else:
+            st, g = "needs_validation", 0
+            det = "Unable to match to a policy category"
+
+        conn.execute("UPDATE inventory SET coverage_status=?, coverage_gap_amount=?, coverage_detail=? WHERE id=?",
+                     (st, g, det, d["id"]))
+        d.update(coverage_status=st, coverage_gap_amount=g, coverage_detail=det)
+        results.append(d)
+
+    # Aggregate gap: if category total exceeds sub-limit, mark all
+    for rd in results:
+        if rd["coverage_status"] == "covered":
+            m = rd.get("mapped_category", "")
+            ct = cat_tots.get(m, 0)
+            lim = limits.get(m, {}).get("limit_amount", 0)
+            if ct > lim > 0:
+                rd.update(coverage_status="coverage_gap", coverage_gap_amount=ct - lim,
+                          coverage_detail=f"Aggregate {m} total ${ct:,.2f} exceeds limit ${lim:,.2f}")
+                conn.execute("UPDATE inventory SET coverage_status=?, coverage_gap_amount=?, coverage_detail=? WHERE id=?",
+                             (rd["coverage_status"], rd["coverage_gap_amount"], rd["coverage_detail"], rd["id"]))
+
+    overall_gap = max(0, total_val - overall) if overall > 0 else 0
+    conn.commit()
+    conn.close()
+
+    cov = sum(1 for r in results if r["coverage_status"] == "covered")
+    nc = sum(1 for r in results if r["coverage_status"] == "not_covered")
+    g2 = sum(1 for r in results if r["coverage_status"] == "coverage_gap")
+    nv = sum(1 for r in results if r["coverage_status"] == "needs_validation")
+
+    return {
+        "policy_id": policy_id, "policy_name": policy["name"],
+        "overall_limit": overall, "deductible": float(policy["deductible"] or 0),
+        "total_value": total_val, "total_gap": overall_gap,
+        "summary": {"covered": cov, "coverage_gap": g2, "not_covered": nc, "needs_validation": nv},
+        "category_breakdowns": [{
+            "category": c, "total_value": t, "limit": limits.get(c, {}).get("limit_amount", 0),
+            "exclusion": limits.get(c, {}).get("exclusion", False),
+            "gap": max(0, t - limits.get(c, {}).get("limit_amount", 0))
+            if not limits.get(c, {}).get("exclusion", False) else t,
+        } for c, t in cat_tots.items()],
+        "items": results,
+    }
+                                "alternate_limit": s["limit_amount"],
+                            })
+        if xrefs:
+            result["cross_policy"] = xrefs
+    return result
 
 @app.get("/api/logs/{service}")
 async def get_logs(service: str):

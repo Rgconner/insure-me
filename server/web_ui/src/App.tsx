@@ -3,6 +3,7 @@ import { useCamera } from "./useCamera";
 import { PolicyUpload } from "./PolicyUpload";
 import { CameraView } from "./CameraView";
 import { InventoryList } from "./InventoryList";
+import { CoverageDashboard } from "./CoverageDashboard";
 import type { InventoryItem } from "./InventoryList";
 
 interface CaptureResult {
@@ -167,6 +168,11 @@ function App() {
               Captured! Trace: {lastResult.trace_id}
             </div>
           )}
+        </section>
+
+        {/* Coverage Comparison — cards #18-#22 */}
+        <section className="bg-white rounded-lg shadow p-6 mb-6">
+          <CoverageDashboard onRefresh={refreshInventory} />
         </section>
 
         {/* Policy Upload — cards #14-#17 */}
