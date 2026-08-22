@@ -30,7 +30,7 @@ export function CoverageDashboard({ onRefresh }: Props) {
   const [running, setRunning] = useState(false);
   const [result, setResult] = useState<CoverageResult | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [expanded, setExpanded] = useState<string | null>(null);
+  const [expanded, _setExpanded] = useState<string | null>(null);
   const [filter, setFilter] = useState<string | null>(null);
 
   const runComparison = useCallback(async () => {

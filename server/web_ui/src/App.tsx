@@ -196,6 +196,7 @@ function App() {
             showArchived={showArchived}
             onToggleArchived={setShowArchived}
             onRefresh={refreshInventory}
+            onCleared={() => {}}
           />
         </section>
       </main>

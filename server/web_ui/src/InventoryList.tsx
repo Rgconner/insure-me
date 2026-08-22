@@ -39,7 +39,7 @@ export function InventoryList({ items, photoFilename, suggestedName, suggestedVa
   const [editingId, setEditingId] = useState<string | null>(null);
   const [deletingId, setDeletingId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [added, setAdded] = useState(false);
+  const [_added, _setAdded] = useState(false);
   const [newName, setNewName] = useState('');
   const [newValue, setNewValue] = useState('');
 
