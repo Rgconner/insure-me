@@ -10,10 +10,12 @@ All pipeline messages published via Redis pub/sub per card #9.
 
 import asyncio
 import base64
+import io
 import json
 import logging
 import os
 import pathlib
+import re
 import sqlite3
 import time
 import uuid
@@ -26,6 +28,7 @@ from fastapi import FastAPI, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
+from PIL import Image
 from pydantic import BaseModel
 
 # ---------------------------------------------------------------------------
@@ -172,10 +175,16 @@ def init_db():
             latitude REAL,
             longitude REAL,
             captured_at TEXT,
+            archived INTEGER DEFAULT 0,
             created_at TEXT NOT NULL DEFAULT (datetime('now')),
             updated_at TEXT NOT NULL DEFAULT (datetime('now'))
         )
     """)
+    # Add archived column to existing tables (safe if already exists)
+    try:
+        conn.execute("ALTER TABLE inventory ADD COLUMN archived INTEGER DEFAULT 0")
+    except sqlite3.OperationalError:
+        pass  # column already exists
     conn.execute("""
         CREATE TABLE IF NOT EXISTS documents (
             id TEXT PRIMARY KEY,
@@ -378,10 +387,13 @@ async def run_identification(trace_id: str, photo_path: str):
         })
         return
 
+    bbox = (primary_result or secondary_result or {}).get("bbox")
+
     result = {
         "trace_id": trace_id,
         "identified_name": identified_name,
         "confidence": confidence,
+        "bbox": bbox,
         "primary_source": VISION_PRIMARY if primary_result else None,
         "secondary_source": VISION_SECONDARY if secondary_result else None,
     }
@@ -390,6 +402,7 @@ async def run_identification(trace_id: str, photo_path: str):
         "status": "identified",
         "identified_name": identified_name,
         "confidence": confidence,
+        "bbox": bbox,
     })
 
     publish_event(CHANNEL_IDENTIFY, trace_id, f"identified:{confidence}", result,
@@ -537,6 +550,31 @@ async def _identify_google(client: httpx.AsyncClient, api_key: str,
 # OpenAI GPT-4V / GPT-4o (card #4)
 # ---------------------------------------------------------------------------
 
+# Center-crop: assume the object is centered — crop the center square of
+# CROP_FRAC of the image's short side before sending to the vision model.
+# Improves identification by removing background clutter.
+CROP_FRAC = 0.55
+
+
+def _center_crop_encoded(photo_path: str):
+    """Return (base64 JPEG of the center crop, geometry dict)."""
+    img = Image.open(pathlib.Path(photo_path))
+    W, H = img.size
+    side = int(min(W, H) * CROP_FRAC)
+    x = (W - side) // 2
+    y = (H - side) // 2
+    crop = img.crop((x, y, x + side, y + side))
+    buf = io.BytesIO()
+    crop.save(buf, format="JPEG")
+    encoded = base64.b64encode(buf.getvalue()).decode("utf-8")
+    return encoded, {"W": W, "H": H, "x": x, "y": y, "side": side}
+
+
+def _regex_bbox(text: str):
+    """Extract a 4-number bbox from 'bbox(x1,y1),(x2,y2)' style output."""
+    m = re.search(r"\((\d+)[,\s]+(\d+)\)[,\s]*\((\d+)[,\s]+(\d+)\)", text)
+    return [float(v) for v in m.groups()] if m else None
+
 async def _identify_openai(client: httpx.AsyncClient, api_key: str,
                             photo_path: str, trace_id: str) -> Optional[dict]:
     """
@@ -548,10 +586,9 @@ async def _identify_openai(client: httpx.AsyncClient, api_key: str,
         return None
 
     try:
-        image_bytes = pathlib.Path(photo_path).read_bytes()
-        encoded = base64.b64encode(image_bytes).decode("utf-8")
+        encoded, geo = _center_crop_encoded(photo_path)
     except Exception as e:
-        logger.error(f"[{trace_id}] Failed to read image for OpenAI: {e}")
+        logger.error(f"[{trace_id}] Failed to read/crop image for OpenAI: {e}")
         return None
 
     payload = {
@@ -562,12 +599,14 @@ async def _identify_openai(client: httpx.AsyncClient, api_key: str,
                 {
                     "type": "text",
                     "text": (
-                        "Identify this object precisely. Return ONLY a JSON object "
-                        "with keys: name (a short plain-string noun phrase, e.g. "
-                        "\"Wooden Chair with Armrests\" — no nested objects), "
-                        "category (one-word: furniture, jewelry, electronics, "
-                        "appliance, art, clothing, tool), "
-                        "confidence (0.0-1.0). No other text."
+                        "Identify the main object in this image. Return ONLY a JSON "
+                        "object with keys: \"name\" (a short plain-string noun phrase, "
+                        "e.g. \"Wooden Chair\", no nested objects), \"category\" "
+                        "(one-word: furniture, jewelry, electronics, appliance, art, "
+                        "clothing, tool), \"confidence\" (a float 0.0-1.0), and "
+                        "\"bbox\" (the object's bounding box as a string "
+                        "\"x1,y1,x2,y2\" with coordinates normalized to 1000, "
+                        "top-left origin). No other text."
                     ),
                 },
                 {
@@ -635,11 +674,45 @@ async def _identify_openai(client: httpx.AsyncClient, api_key: str,
         except (TypeError, ValueError):
             confidence = 0.5
 
+        # Parse bounding box (crop-relative, 0-1000) and map to full-frame
+        # fractions so the frontend can draw it on the original photo.
+        bbox = None
+        bbox_raw = result.get("bbox")
+        if isinstance(bbox_raw, str):
+            nums = []
+            for part in bbox_raw.replace("(", "").replace(")", "").split(","):
+                try:
+                    nums.append(float(part.strip()))
+                except ValueError:
+                    break
+            if len(nums) == 4:
+                bbox = nums
+        elif isinstance(bbox_raw, list) and len(bbox_raw) == 4:
+            bbox = [float(v) for v in bbox_raw]
+
+        if bbox is None:
+            bbox = _regex_bbox(content)
+
+        full_bbox = None
+        if bbox is not None:
+            try:
+                bx1, by1, bx2, by2 = [v / 1000.0 for v in bbox]
+                W, H, cx, cy, side = geo["W"], geo["H"], geo["x"], geo["y"], geo["side"]
+                full_bbox = [
+                    round((cx + bx1 * side) / W, 4),
+                    round((cy + by1 * side) / H, 4),
+                    round((cx + bx2 * side) / W, 4),
+                    round((cy + by2 * side) / H, 4),
+                ]
+            except (TypeError, ValueError, ZeroDivisionError):
+                full_bbox = None
+
         return {
             "name": name or "Unknown",
             "category": category or "general",
             "source": "openai",
             "raw_confidence": confidence,
+            "bbox": full_bbox,
         }
     except (KeyError, json.JSONDecodeError, IndexError, TypeError) as e:
         logger.error(f"[{trace_id}] Failed to parse LLM response: {e}")
@@ -697,13 +770,14 @@ async def run_pricing(trace_id: str, identified_name: str):
         "value_source": value_source,
     }
 
-    # Carry the identification confidence forward into the priced state so
-    # the UI can show it (the pricing step doesn't re-derive it).
+    # Carry the identification confidence + bbox forward into the priced state
+    # so the UI can show them (the pricing step doesn't re-derive them).
     prior = get_trace_state(trace_id)
     store_trace_state(trace_id, {
         "status": "priced",
         "identified_name": identified_name,
         "confidence": prior.get("confidence", ""),
+        "bbox": prior.get("bbox"),
         "estimated_value": value,
         "value_source": value_source,
     })
@@ -872,14 +946,56 @@ async def llm_estimate(client: httpx.AsyncClient, item_name: str, trace_id: str)
 # ---------------------------------------------------------------------------
 
 @app.get("/api/inventory")
-async def list_inventory():
-    """List all cataloged items."""
+async def list_inventory(archived: str = "false", show_all: str = "false"):
+    """List cataloged items. Default: non-archived only.
+       ?archived=true — only archived. ?show_all=true — everything."""
     conn = get_db()
-    rows = conn.execute(
-        "SELECT * FROM inventory ORDER BY created_at DESC"
-    ).fetchall()
+    if show_all.lower() == "true":
+        rows = conn.execute(
+            "SELECT * FROM inventory ORDER BY created_at DESC"
+        ).fetchall()
+    elif archived.lower() == "true":
+        rows = conn.execute(
+            "SELECT * FROM inventory WHERE archived = 1 ORDER BY created_at DESC"
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT * FROM inventory WHERE archived = 0 ORDER BY created_at DESC"
+        ).fetchall()
     conn.close()
     return [dict(row) for row in rows]
+
+
+@app.patch("/api/inventory/{item_id}/archive")
+async def archive_item(item_id: str):
+    """Archive an item — hides it from inventory and coverage."""
+    conn = get_db()
+    row = conn.execute("SELECT * FROM inventory WHERE id = ?", (item_id,)).fetchone()
+    if not row:
+        conn.close()
+        raise HTTPException(status_code=404, detail="Item not found")
+    conn.execute("UPDATE inventory SET archived = 1, updated_at = ? WHERE id = ?",
+                 (datetime.now(timezone.utc).isoformat(), item_id))
+    conn.commit()
+    row = conn.execute("SELECT * FROM inventory WHERE id = ?", (item_id,)).fetchone()
+    conn.close()
+    return dict(row)
+
+
+@app.patch("/api/inventory/{item_id}/restore")
+async def restore_item(item_id: str):
+    """Restore an archived item back to active inventory."""
+    conn = get_db()
+    row = conn.execute("SELECT * FROM inventory WHERE id = ?", (item_id,)).fetchone()
+    if not row:
+        conn.close()
+        raise HTTPException(status_code=404, detail="Item not found")
+    conn.execute("UPDATE inventory SET archived = 0, updated_at = ? WHERE id = ?",
+                 (datetime.now(timezone.utc).isoformat(), item_id))
+    conn.commit()
+    row = conn.execute("SELECT * FROM inventory WHERE id = ?", (item_id,)).fetchone()
+    conn.close()
+    return dict(row)
 
 
 @app.get("/api/inventory/{item_id}")

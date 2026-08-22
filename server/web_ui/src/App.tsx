@@ -27,13 +27,17 @@ function App() {
   const [pipeline, setPipeline] = useState<PipelineResult | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [inventory, setInventory] = useState<InventoryItem[]>([]);
+  const [showArchived, setShowArchived] = useState(false);
 
   const refreshInventory = useCallback(() => {
-    fetch("/api/inventory")
+    const url = showArchived
+      ? "/api/inventory?show_all=true"
+      : "/api/inventory";
+    fetch(url)
       .then((r) => r.json())
       .then(setInventory)
       .catch(() => {});
-  }, []);
+  }, [showArchived]);
 
   // Fetch inventory on mount
   useEffect(() => {
@@ -174,6 +178,8 @@ function App() {
             photoFilename={lastResult?.photo_filename ?? null}
             suggestedName={pipeline?.identified_name ?? null}
             suggestedValue={pipeline?.estimated_value != null ? String(pipeline.estimated_value) : null}
+            showArchived={showArchived}
+            onToggleArchived={setShowArchived}
             onRefresh={refreshInventory}
           />
         </section>

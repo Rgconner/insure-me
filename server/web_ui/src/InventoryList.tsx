@@ -11,6 +11,7 @@ export interface InventoryItem {
   latitude: number | null;
   longitude: number | null;
   captured_at: string;
+  archived: number;
   created_at: string;
 }
 
@@ -27,14 +28,18 @@ interface Props {
   photoFilename: string | null;
   suggestedName: string | null;
   suggestedValue: string | null;
+  showArchived: boolean;
+  onToggleArchived: (show: boolean) => void;
   onRefresh: () => void;
+  onCleared: () => void;
 }
 
-export function InventoryList({ items, photoFilename, suggestedName, suggestedValue, onRefresh }: Props) {
+export function InventoryList({ items, photoFilename, suggestedName, suggestedValue, showArchived, onToggleArchived, onRefresh, onCleared }: Props) {
   const [adding, setAdding] = useState(false);
   const [editingId, setEditingId] = useState<string | null>(null);
   const [deletingId, setDeletingId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [added, setAdded] = useState(false);
   const [newName, setNewName] = useState('');
   const [newValue, setNewValue] = useState('');
 
@@ -47,6 +52,23 @@ export function InventoryList({ items, photoFilename, suggestedName, suggestedVa
   const [editValue, setEditValue] = useState('');
   const [expandedDocs, setExpandedDocs] = useState<string | null>(null);
   const [documents, setDocuments] = useState<Record<string, DocItem[]>>({});
+  const [archivingId, setArchivingId] = useState<string | null>(null);
+
+  const handleArchive = useCallback(async (itemId: string) => {
+    try {
+      await fetch(`/api/inventory/${itemId}/archive`, { method: 'PATCH' });
+      setArchivingId(null);
+      onRefresh();
+    } catch { /* ignore */ }
+  }, [onRefresh]);
+
+  const handleRestore = useCallback(async (itemId: string) => {
+    try {
+      await fetch(`/api/inventory/${itemId}/restore`, { method: 'PATCH' });
+      setArchivingId(null);
+      onRefresh();
+    } catch { /* ignore */ }
+  }, [onRefresh]);
 
   const fetchDocs = useCallback(async (itemId: string) => {
     try {
@@ -97,11 +119,14 @@ export function InventoryList({ items, photoFilename, suggestedName, suggestedVa
       });
       if (!res.ok) throw new Error(await res.text());
       setNewName(''); setNewValue('');
+      setAdded(true);
+      setTimeout(() => setAdded(false), 2500);
       onRefresh();
+      onCleared();
     } catch (err: unknown) {
       setError(err instanceof Error ? err.message : String(err));
     } finally { setAdding(false); }
-  }, [newName, newValue, photoFilename, onRefresh]);
+  }, [newName, newValue, photoFilename, onRefresh, onCleared]);
 
   const handleEdit = useCallback(async (id: string) => {
     if (!editName.trim()) return;
@@ -178,6 +203,18 @@ export function InventoryList({ items, photoFilename, suggestedName, suggestedVa
       )}
 
       {/* Inventory grid */}
+      <div className="flex items-center justify-between mb-3">
+        <span className="text-xs text-gray-500">
+          {items.length} item{items.length !== 1 ? 's' : ''}
+          {items.some(i => i.archived) ? ' (some archived)' : ''}
+        </span>
+        <label className="flex items-center gap-1.5 text-xs text-gray-600 cursor-pointer">
+          <input type="checkbox" checked={showArchived}
+            onChange={(e) => onToggleArchived(e.target.checked)}
+            className="rounded" />
+          Show Archived
+        </label>
+      </div>
       {items.length === 0 && !photoFilename ? (
         <p className="text-gray-500 text-center py-8">
           No items cataloged yet. Capture a photo above to get started.
@@ -213,7 +250,13 @@ export function InventoryList({ items, photoFilename, suggestedName, suggestedVa
                 ) : (
                   <>
                     <p className="font-medium text-gray-900">
-                      {item.identified_name || 'Unidentified'}</p>
+                      {item.identified_name || 'Unidentified'}
+                      {item.archived ? (
+                        <span className="ml-2 px-1.5 py-0.5 bg-amber-100 text-amber-800 text-xs rounded">
+                          {'\u{1F4E6}'} Archived
+                        </span>
+                      ) : null}
+                    </p>
                     {item.estimated_value != null && item.estimated_value > 0 && (
                       <p className="text-lg font-bold text-green-700">
                         ${item.estimated_value.toLocaleString()}</p>
@@ -283,6 +326,25 @@ export function InventoryList({ items, photoFilename, suggestedName, suggestedVa
                     <div className="flex gap-2 mt-3">
                       <button onClick={() => startEdit(item)}
                         className="text-xs text-blue-600 hover:underline">Edit</button>
+                      {item.archived ? (
+                        <>
+                          {archivingId === item.id ? (
+                            <span className="text-xs text-gray-400">restoring...</span>
+                          ) : (
+                            <button onClick={() => { setArchivingId(item.id); handleRestore(item.id); }}
+                              className="text-xs text-green-600 hover:underline">Restore</button>
+                          )}
+                        </>
+                      ) : (
+                        <>
+                          {archivingId === item.id ? (
+                            <span className="text-xs text-gray-400">archiving...</span>
+                          ) : (
+                            <button onClick={() => { setArchivingId(item.id); handleArchive(item.id); }}
+                              className="text-xs text-amber-600 hover:underline">{'\u{1F4E6}'} Archive</button>
+                          )}
+                        </>
+                      )}
                       {deletingId === item.id ? (
                         <span className="text-xs text-red-600">
                           Delete?{' '}
