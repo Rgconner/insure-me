@@ -1,5 +1,6 @@
 import { useState, useCallback, useEffect } from "react";
 import { useCamera } from "./useCamera";
+import { PolicyUpload } from "./PolicyUpload";
 import { CameraView } from "./CameraView";
 import { InventoryList } from "./InventoryList";
 import type { InventoryItem } from "./InventoryList";
@@ -166,6 +167,14 @@ function App() {
               Captured! Trace: {lastResult.trace_id}
             </div>
           )}
+        </section>
+
+        {/* Policy Upload — cards #14-#17 */}
+        <section className="bg-white rounded-lg shadow p-6 mb-6">
+          <PolicyUpload onPolicyReady={(p) => {
+            // Policy ready for comparison (cards #18-#22)
+            console.log("Policy ready:", p?.id);
+          }} />
         </section>
 
         {/* Inventory — card #6 */}

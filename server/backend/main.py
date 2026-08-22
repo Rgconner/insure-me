@@ -195,6 +195,47 @@ def init_db():
             FOREIGN KEY (inventory_id) REFERENCES inventory(id)
         )
     """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS policies (
+            id TEXT PRIMARY KEY,
+            name TEXT DEFAULT 'Untitled Policy',
+            raw_text TEXT DEFAULT '',
+            overall_limit REAL DEFAULT 0,
+            deductible REAL DEFAULT 0,
+            effective_date TEXT DEFAULT '',
+            expiration_date TEXT DEFAULT '',
+            covered_address TEXT DEFAULT '',
+            active INTEGER DEFAULT 1,
+            reviewed INTEGER DEFAULT 0,
+            version INTEGER DEFAULT 1,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS policy_sub_limits (
+            id TEXT PRIMARY KEY,
+            policy_id TEXT NOT NULL,
+            category TEXT NOT NULL,
+            limit_amount REAL DEFAULT 0,
+            exclusion INTEGER DEFAULT 0,
+            description TEXT DEFAULT '',
+            applies_to TEXT DEFAULT '',
+            rider INTEGER DEFAULT 0,
+            FOREIGN KEY (policy_id) REFERENCES policies(id)
+        )
+    """)
+    # Add coverage columns to inventory (safe if they already exist)
+    for col, col_def in [
+        ("coverage_status", "TEXT"),
+        ("coverage_gap_amount", "REAL"),
+        ("coverage_detail", "TEXT"),
+        ("category_override", "TEXT"),
+    ]:
+        try:
+            conn.execute(f"ALTER TABLE inventory ADD COLUMN {col} {col_def}")
+        except sqlite3.OperationalError:
+            pass
     conn.commit()
     conn.close()
     logger.info("Database initialized")
@@ -248,6 +289,33 @@ class CatalogItem(BaseModel):
     latitude: float | None = None
     longitude: float | None = None
     captured_at: str = ""
+
+# ---------------------------------------------------------------------------
+# Policy models (cards #14-#17)
+# ---------------------------------------------------------------------------
+
+class PolicyUploadRequest(BaseModel):
+    url: str = ""          # URL to a PDF file
+    text: str = ""         # Pasted policy text
+    name: str = ""         # Optional policy name
+
+class PolicySubLimit(BaseModel):
+    category: str
+    limit_amount: float = 0
+    exclusion: bool = False
+    description: str = ""
+    applies_to: str = ""
+    rider: bool = False
+
+class PolicyUpdate(BaseModel):
+    name: str = ""
+    overall_limit: float = 0
+    deductible: float = 0
+    effective_date: str = ""
+    expiration_date: str = ""
+    covered_address: str = ""
+    reviewed: bool = False
+    sub_limits: list[PolicySubLimit] = []
 
 # ---------------------------------------------------------------------------
 # Counters
@@ -1166,6 +1234,258 @@ async def delete_document(doc_id: str):
     return {"status": "deleted", "id": doc_id}
 
 
+# ---------------------------------------------------------------------------
+# Policies — Upload + Parse + CRUD (cards #14-#17)
+# ---------------------------------------------------------------------------
+
+POLICY_UPLOAD_DIR = UPLOAD_DIR / "policies"
+POLICY_UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _extract_pdf_text(file_path: str) -> str:
+    """Extract text from a PDF using pdfplumber."""
+    try:
+        import pdfplumber
+        text_parts = []
+        with pdfplumber.open(file_path) as pdf:
+            for page in pdf.pages:
+                t = page.extract_text()
+                if t:
+                    text_parts.append(t)
+        return "\n\n".join(text_parts)
+    except Exception as e:
+        logger.error(f"PDF text extraction failed: {e}")
+        return ""
+
+
+@app.post("/api/policies/upload")
+async def upload_policy(file: UploadFile | None = None, body: PolicyUploadRequest | None = None):
+    """Upload a policy: PDF file, URL, or pasted text."""
+    policy_id = str(uuid.uuid4())
+    raw_text = ""
+    name = ""
+
+    if file:
+        ext = pathlib.Path(file.filename).suffix if file.filename else ".pdf"
+        policy_filename = f"policy-{policy_id}{ext}"
+        policy_path = POLICY_UPLOAD_DIR / policy_filename
+        content = await file.read()
+        policy_path.write_bytes(content)
+        raw_text = _extract_pdf_text(str(policy_path))
+        name = file.filename or "Uploaded Policy"
+    elif body and body.url:
+        try:
+            async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT) as client:
+                resp = await client.get(body.url)
+                resp.raise_for_status()
+                content_bytes = resp.content
+                url_path = pathlib.PurePosixPath(body.url.split("?")[0])
+                ext = url_path.suffix if url_path.suffix in (".pdf", ".txt") else ".pdf"
+                policy_filename = f"policy-{policy_id}{ext}"
+                policy_path = POLICY_UPLOAD_DIR / policy_filename
+                policy_path.write_bytes(content_bytes)
+                raw_text = _extract_pdf_text(str(policy_path)) if ext == ".pdf" else content_bytes.decode("utf-8", errors="replace")
+                name = body.name or url_path.name or "Policy from URL"
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Failed to fetch URL: {e}")
+    elif body and body.text:
+        raw_text = body.text
+        name = body.name or "Pasted Policy Text"
+    else:
+        raise HTTPException(status_code=400, detail="No file, URL, or text provided")
+
+    now = datetime.now(timezone.utc).isoformat()
+    conn = get_db()
+    conn.execute(
+        "INSERT INTO policies (id, name, raw_text, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
+        (policy_id, name, raw_text, now, now),
+    )
+    conn.execute("UPDATE policies SET active = 0 WHERE id != ?", (policy_id,))
+    conn.commit()
+    row = conn.execute("SELECT * FROM policies WHERE id = ?", (policy_id,)).fetchone()
+    conn.close()
+    return dict(row)
+
+
+@app.get("/api/policies")
+async def list_policies():
+    conn = get_db()
+    rows = conn.execute("SELECT * FROM policies ORDER BY created_at DESC").fetchall()
+    conn.close()
+    return [dict(row) for row in rows]
+
+
+async def _policy_with_sub_limits(policy: dict) -> dict:
+    conn = get_db()
+    subs = conn.execute("SELECT * FROM policy_sub_limits WHERE policy_id = ?", (policy["id"],)).fetchall()
+    conn.close()
+    policy["sub_limits"] = [dict(s) for s in subs]
+    return policy
+
+
+@app.get("/api/policies/active")
+async def get_active_policy():
+    conn = get_db()
+    row = conn.execute("SELECT * FROM policies WHERE active = 1 ORDER BY created_at DESC LIMIT 1").fetchone()
+    conn.close()
+    if not row:
+        raise HTTPException(status_code=404, detail="No active policy")
+    return await _policy_with_sub_limits(dict(row))
+
+
+@app.post("/api/policies/{policy_id}/parse")
+async def parse_policy(policy_id: str):
+    """Send policy text to LLM for structured extraction."""
+    conn = get_db()
+    row = conn.execute("SELECT * FROM policies WHERE id = ?", (policy_id,)).fetchone()
+    if not row:
+        conn.close()
+        raise HTTPException(status_code=404, detail="Policy not found")
+    raw_text = row["raw_text"]
+    conn.close()
+    if not raw_text:
+        raise HTTPException(status_code=400, detail="Policy has no text to parse")
+
+    api_key = LLM_API_KEY
+    if not api_key:
+        raise HTTPException(status_code=400, detail="LLM_API_KEY not configured")
+
+    prompt = (
+        "Extract structured insurance policy data from the following text. "
+        "Return ONLY a JSON object with these keys:\n"
+        "- policy_name: human-readable name\n"
+        "- overall_personal_property_limit: total PP limit in USD (number)\n"
+        "- deductible: deductible in USD (number)\n"
+        "- effective_date: YYYY-MM-DD\n- expiration_date: YYYY-MM-DD\n"
+        "- covered_address: the covered property address\n"
+        "- sub_limits: array of objects with: category (string), limit_amount (number), "
+        "exclusion (bool), description (string)\n"
+        "- special_conditions: array of objects with: condition (string), detail (string)\n"
+        "Flag business property exclusions, outbuilding coverage, scheduled-item riders.\n"
+        "If a field is not found, set to null or empty.\n\n"
+        f"Policy Text:\n{raw_text[:12000]}"
+    )
+
+    payload = {
+        "model": "gpt-4o", "messages": [{"role": "user", "content": prompt}],
+        "max_tokens": 2000, "temperature": 0.0,
+    }
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+
+    import time as _time
+    parsed_data = None
+    last_error = None
+    for _ in range(2):
+        try:
+            async with httpx.AsyncClient(timeout=60.0) as client:
+                resp = await client.post(LLM_API_URL, json=payload, headers=headers)
+                resp.raise_for_status()
+                data = resp.json()
+                content = data["choices"][0]["message"]["content"].strip()
+                if content.startswith("```"):
+                    content = content.split("\n", 1)[1] if "\n" in content else content[3:]
+                    if content.endswith("```"):
+                        content = content[:-3]
+                parsed_data = json.loads(content.strip())
+                break
+        except Exception as e:
+            last_error = str(e)
+            _time.sleep(2)
+
+    if parsed_data is None:
+        conn = get_db()
+        conn.execute("UPDATE policies SET reviewed = -1 WHERE id = ?", (policy_id,))
+        conn.commit()
+        conn.close()
+        raise HTTPException(status_code=422, detail=f"LLM parsing failed: {last_error}")
+
+    now = datetime.now(timezone.utc).isoformat()
+    conn = get_db()
+    conn.execute(
+        "UPDATE policies SET name=?, overall_limit=?, deductible=?, effective_date=?,"
+        " expiration_date=?, covered_address=?, reviewed=1, updated_at=? WHERE id=?",
+        (parsed_data.get("policy_name", row["name"]),
+         float(parsed_data.get("overall_personal_property_limit") or 0),
+         float(parsed_data.get("deductible") or 0),
+         parsed_data.get("effective_date", ""), parsed_data.get("expiration_date", ""),
+         parsed_data.get("covered_address", ""), now, policy_id))
+    conn.execute("DELETE FROM policy_sub_limits WHERE policy_id = ?", (policy_id,))
+    for sl in (parsed_data.get("sub_limits") or []):
+        sub_id = str(uuid.uuid4())
+        conn.execute(
+            "INSERT INTO policy_sub_limits (id, policy_id, category, limit_amount, exclusion, description)"
+            " VALUES (?, ?, ?, ?, ?, ?)",
+            (sub_id, policy_id, sl.get("category", "other"),
+             float(sl.get("limit_amount") or 0), 1 if sl.get("exclusion") else 0,
+             sl.get("description", "")))
+    conn.commit()
+    row = conn.execute("SELECT * FROM policies WHERE id = ?", (policy_id,)).fetchone()
+    conn.close()
+    result = await _policy_with_sub_limits(dict(row))
+    result["parsed_from_llm"] = parsed_data
+    return result
+@app.get("/api/policies/{policy_id}")
+async def get_policy(policy_id: str):
+    conn = get_db()
+    row = conn.execute("SELECT * FROM policies WHERE id = ?", (policy_id,)).fetchone()
+    if not row:
+@app.patch("/api/policies/{policy_id}")
+async def update_policy(policy_id: str, update: PolicyUpdate):
+    """Update a policy and its sub-limits after user review/edit."""
+    conn = get_db()
+    row = conn.execute("SELECT * FROM policies WHERE id = ?", (policy_id,)).fetchone()
+    if not row:
+        conn.close()
+        raise HTTPException(status_code=404, detail="Policy not found")
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute(
+        "UPDATE policies SET name=?, overall_limit=?, deductible=?, effective_date=?,"
+        " expiration_date=?, covered_address=?, reviewed=?, updated_at=? WHERE id=?",
+        (update.name or row["name"], update.overall_limit, update.deductible,
+         update.effective_date or row["effective_date"],
+         update.expiration_date or row["expiration_date"],
+         update.covered_address or row["covered_address"],
+         1 if update.reviewed else row["reviewed"], now, policy_id))
+    if update.sub_limits:
+        conn.execute("DELETE FROM policy_sub_limits WHERE policy_id = ?", (policy_id,))
+        for sl in update.sub_limits:
+            sub_id = str(uuid.uuid4())
+            conn.execute(
+                "INSERT INTO policy_sub_limits (id, policy_id, category, limit_amount,"
+                " exclusion, description, applies_to, rider) VALUES (?,?,?,?,?,?,?,?)",
+                (sub_id, policy_id, sl.category, sl.limit_amount,
+                 1 if sl.exclusion else 0, sl.description, sl.applies_to, 1 if sl.rider else 0))
+    conn.commit()
+    row = conn.execute("SELECT * FROM policies WHERE id = ?", (policy_id,)).fetchone()
+    conn.close()
+    return await _policy_with_sub_limits(dict(row))
+
+
+@app.patch("/api/policies/{policy_id}/activate")
+async def activate_policy(policy_id: str):
+    conn = get_db()
+    conn.execute("UPDATE policies SET active = 0")
+    conn.execute("UPDATE policies SET active = 1 WHERE id = ?", (policy_id,))
+    conn.commit()
+    row = conn.execute("SELECT * FROM policies WHERE id = ?", (policy_id,)).fetchone()
+    conn.close()
+    if not row:
+        raise HTTPException(status_code=404, detail="Policy not found")
+    return await _policy_with_sub_limits(dict(row))
+
+
+@app.delete("/api/policies/{policy_id}")
+async def delete_policy(policy_id: str):
+    conn = get_db()
+    conn.execute("DELETE FROM policy_sub_limits WHERE policy_id = ?", (policy_id,))
+    conn.execute("DELETE FROM policies WHERE id = ?", (policy_id,))
+    conn.commit()
+    conn.close()
+    return {"status": "deleted", "id": policy_id}
+        conn.close()
+        raise HTTPException(status_code=404, detail="Policy not found")
+    conn.close()
+    return await _policy_with_sub_limits(dict(row))
 
 # Debug endpoints
 # ---------------------------------------------------------------------------
