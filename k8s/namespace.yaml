@@ -1,0 +1,23 @@
+---
+# insure-me k8s manifests
+#
+# Apply order:
+#   kubectl apply -f k8s/namespace.yaml
+#   kubectl apply -f k8s/redis.yaml
+#   kubectl apply -f k8s/backend.yaml
+#   kubectl apply -f k8s/web-ui.yaml
+#   kubectl apply -f k8s/traefik-ingressroute.yaml
+#   kubectl -n insure-me rollout status deployment/backend
+#   kubectl -n insure-me rollout status deployment/web-ui
+#
+# Public access is via the shared Traefik edge (insure-me.example.com) —
+# no per-app cloudflared tunnel. Add the DNS/public-hostname record in
+# Cloudflare pointing at the existing edge, same as board/git/bss.example.com.
+
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: insure-me
+  labels:
+    app.kubernetes.io/part-of: insure-me

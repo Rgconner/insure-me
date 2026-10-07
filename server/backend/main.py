@@ -1,0 +1,1679 @@
+"""
+Insure Me — Backend API
+
+Vision-powered home inventory builder.
+Pipeline: Capture → Identify → Price → Catalog
+
+All external calls wrapped with timeouts and error handling per card #8.
+All pipeline messages published via Redis pub/sub per card #9.
+"""
+
+import asyncio
+import base64
+import io
+import json
+import logging
+import os
+import pathlib
+import re
+import sqlite3
+import time
+import uuid
+from datetime import datetime, timezone
+from typing import Optional
+
+import httpx
+import redis as redis_lib
+from fastapi import FastAPI, HTTPException, Request, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from fastapi.staticfiles import StaticFiles
+from PIL import Image
+from pydantic import BaseModel
+
+# ---------------------------------------------------------------------------
+# Service identity
+# ---------------------------------------------------------------------------
+
+SERVICE_NAME = "insure-me-backend"
+_VERSION_FILE = pathlib.Path(__file__).parent / "VERSION"
+SERVICE_VERSION = (
+    _VERSION_FILE.read_text().strip()
+    if _VERSION_FILE.exists()
+    else os.getenv("SERVICE_VERSION", "unknown")
+)
+_STARTED_AT = datetime.now(timezone.utc).isoformat()
+_START_MONO = time.monotonic()
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+
+REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
+DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./insure-me.db")
+
+# Vision sources (env vars — pluggable per card #2/#3/#4)
+VISION_PRIMARY = os.getenv("VISION_PRIMARY", "google")
+VISION_SECONDARY = os.getenv("VISION_SECONDARY", "openai")
+VISION_PRIMARY_KEY = os.getenv("VISION_PRIMARY_KEY", "")
+VISION_SECONDARY_KEY = os.getenv("VISION_SECONDARY_KEY", "")
+
+# Value estimation (card #5)
+SEARCH_API_KEY = os.getenv("SEARCH_API_KEY", "")
+LLM_API_KEY = os.getenv("LLM_API_KEY", "")
+
+# OpenAI-compatible LLM endpoint. Defaults to OpenAI; point at a local
+# vision/LLM server (LM Studio / Ollama) by setting LLM_BASE_URL + LLM_MODEL.
+LLM_BASE_URL = os.getenv("LLM_BASE_URL", "https://api.openai.com/v1").rstrip("/")
+LLM_MODEL = os.getenv("LLM_MODEL", "gpt-4o")
+
+# External call timeouts (card #8)
+DEFAULT_TIMEOUT = float(os.getenv("EXTERNAL_TIMEOUT_SECONDS", "15.0"))
+
+# Uploads
+UPLOAD_DIR = pathlib.Path(os.getenv("UPLOAD_DIR", "uploads"))
+UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(SERVICE_NAME)
+
+# ---------------------------------------------------------------------------
+# Redis + Pub/Sub (card #9)
+# ---------------------------------------------------------------------------
+
+redis_client = redis_lib.from_url(REDIS_URL, decode_responses=True)
+
+CHANNEL_CAPTURE = "insure-me:capture"
+CHANNEL_IDENTIFY = "insure-me:identify"
+CHANNEL_PRICE = "insure-me:price"
+CHANNEL_CATALOG = "insure-me:catalog"
+CHANNEL_DEAD_LETTER = "insure-me:dead_letter"
+
+
+def publish_event(channel: str, trace_id: str, stage: str, payload: dict, source: str = ""):
+    """Publish a traceable event to Redis."""
+    msg = {
+        "trace_id": trace_id,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "stage": stage,
+        "source": source,
+        "payload": payload,
+    }
+    try:
+        redis_client.publish(channel, json.dumps(msg))
+        logger.debug(f"[{trace_id}] published to {channel}: {stage}")
+    except Exception as e:
+        logger.error(f"[{trace_id}] failed to publish to {channel}: {e}")
+
+
+def publish_dead_letter(trace_id: str, stage: str, error: str, payload: dict = None):
+    """Publish failed events to dead_letter channel for inspection."""
+    publish_event(CHANNEL_DEAD_LETTER, trace_id, stage, {
+        "error": error,
+        "original_payload": payload or {},
+    }, source=SERVICE_NAME)
+
+
+# Pipeline state store — the /api/capture/{trace_id} endpoint reads this so the
+# browser can poll for the identification/pricing result. Keys expire after a
+# short TTL (no unbounded growth).
+TRACE_TTL = 300  # seconds
+
+def _trace_key(trace_id: str) -> str:
+    return f"insure-me:trace:{trace_id}"
+
+
+def store_trace_state(trace_id: str, state: dict) -> None:
+    """Persist the latest pipeline state for a trace_id (JSON in Redis)."""
+    try:
+        redis_client.set(_trace_key(trace_id), json.dumps(state), ex=TRACE_TTL)
+    except Exception as e:
+        logger.error(f"[{trace_id}] failed to store trace state: {e}")
+
+
+def get_trace_state(trace_id: str) -> dict:
+    """Read pipeline state for a trace_id (empty dict if absent)."""
+    try:
+        raw = redis_client.get(_trace_key(trace_id))
+        return json.loads(raw) if raw else {}
+    except Exception as e:
+        logger.error(f"[{trace_id}] failed to read trace state: {e}")
+        return {}
+
+# ---------------------------------------------------------------------------
+# Database
+# ---------------------------------------------------------------------------
+
+DB_PATH = DATABASE_URL.replace("sqlite:///", "")
+if not os.path.isabs(DB_PATH):
+    DB_PATH = str(pathlib.Path(__file__).parent / DB_PATH)
+
+
+def get_db() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    return conn
+
+
+def init_db():
+    conn = get_db()
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS inventory (
+            id TEXT PRIMARY KEY,
+            photo_path TEXT NOT NULL,
+            identified_name TEXT,
+            category TEXT,
+            estimated_value REAL,
+            value_source TEXT,
+            confidence REAL,
+            narration TEXT DEFAULT '',
+            latitude REAL,
+            longitude REAL,
+            captured_at TEXT,
+            archived INTEGER DEFAULT 0,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+        )
+    """)
+    # Add archived column to existing tables (safe if already exists)
+    try:
+        conn.execute("ALTER TABLE inventory ADD COLUMN archived INTEGER DEFAULT 0")
+    except sqlite3.OperationalError:
+        pass  # column already exists
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS documents (
+            id TEXT PRIMARY KEY,
+            inventory_id TEXT NOT NULL,
+            photo_path TEXT NOT NULL,
+            doc_type TEXT DEFAULT 'other',
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            FOREIGN KEY (inventory_id) REFERENCES inventory(id)
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS policies (
+            id TEXT PRIMARY KEY,
+            name TEXT DEFAULT 'Untitled Policy',
+            raw_text TEXT DEFAULT '',
+            overall_limit REAL DEFAULT 0,
+            deductible REAL DEFAULT 0,
+            effective_date TEXT DEFAULT '',
+            expiration_date TEXT DEFAULT '',
+            covered_address TEXT DEFAULT '',
+            active INTEGER DEFAULT 1,
+            reviewed INTEGER DEFAULT 0,
+            version INTEGER DEFAULT 1,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS policy_sub_limits (
+            id TEXT PRIMARY KEY,
+            policy_id TEXT NOT NULL,
+            category TEXT NOT NULL,
+            limit_amount REAL DEFAULT 0,
+            exclusion INTEGER DEFAULT 0,
+            description TEXT DEFAULT '',
+            applies_to TEXT DEFAULT '',
+            rider INTEGER DEFAULT 0,
+            FOREIGN KEY (policy_id) REFERENCES policies(id)
+        )
+    """)
+    # Add coverage columns to inventory (safe if they already exist)
+    for col, col_def in [
+        ("coverage_status", "TEXT"),
+        ("coverage_gap_amount", "REAL"),
+        ("coverage_detail", "TEXT"),
+        ("category_override", "TEXT"),
+    ]:
+        try:
+            conn.execute(f"ALTER TABLE inventory ADD COLUMN {col} {col_def}")
+        except sqlite3.OperationalError:
+            pass
+    conn.commit()
+    conn.close()
+    logger.info("Database initialized")
+# ---------------------------------------------------------------------------
+# FastAPI app
+# ---------------------------------------------------------------------------
+
+app = FastAPI(title="Insure Me", version=SERVICE_VERSION)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Serve uploaded photos
+app.mount("/uploads", StaticFiles(directory=str(UPLOAD_DIR)), name="uploads")
+
+# ---------------------------------------------------------------------------
+# Models
+# ---------------------------------------------------------------------------
+
+class InventoryItem(BaseModel):
+    id: str
+    identified_name: Optional[str] = None
+    category: Optional[str] = None
+    estimated_value: Optional[float] = None
+    value_source: Optional[str] = None
+    confidence: Optional[float] = None
+    created_at: str
+    updated_at: str
+
+
+class PriceRequest(BaseModel):
+    trace_id: str
+    identified_name: str
+    category: Optional[str] = None
+
+
+class CatalogItem(BaseModel):
+    trace_id: str
+    photo_filename: str = ""
+    identified_name: str
+    category: Optional[str] = None
+    estimated_value: float
+    value_source: str
+    confidence: float
+    narration: str = ""
+    latitude: float | None = None
+    longitude: float | None = None
+    captured_at: str = ""
+
+# ---------------------------------------------------------------------------
+# Policy models (cards #14-#17)
+# ---------------------------------------------------------------------------
+
+class PolicyUploadRequest(BaseModel):
+    url: str = ""          # URL to a PDF file
+    text: str = ""         # Pasted policy text
+    name: str = ""         # Optional policy name
+
+class PolicySubLimit(BaseModel):
+    category: str
+    limit_amount: float = 0
+    exclusion: bool = False
+    description: str = ""
+    applies_to: str = ""
+    rider: bool = False
+
+class PolicyUpdate(BaseModel):
+    name: str = ""
+    overall_limit: float = 0
+    deductible: float = 0
+    effective_date: str = ""
+    expiration_date: str = ""
+    covered_address: str = ""
+    reviewed: bool = False
+    sub_limits: list[PolicySubLimit] = []
+
+# ---------------------------------------------------------------------------
+# Counters
+# ---------------------------------------------------------------------------
+
+_COUNTERS: dict[str, int] = {
+    "captures_received": 0,
+    "identifications_run": 0,
+    "prices_estimated": 0,
+    "items_cataloged": 0,
+}
+
+# ---------------------------------------------------------------------------
+# Health / telemetry
+# ---------------------------------------------------------------------------
+
+@app.get("/health")
+async def health():
+    return {
+        "service": SERVICE_NAME,
+        "version": SERVICE_VERSION,
+        "status": "ok",
+        "uptime_seconds": time.monotonic() - _START_MONO,
+    }
+
+
+@app.get("/api/versions")
+async def versions():
+    return {"service": SERVICE_NAME, "version": SERVICE_VERSION}
+
+
+@app.get("/api/telemetry")
+async def telemetry():
+    return {
+        "service": SERVICE_NAME,
+        "version": SERVICE_VERSION,
+        "started_at": _STARTED_AT,
+        "uptime_seconds": time.monotonic() - _START_MONO,
+        "counters": _COUNTERS,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Capture — upload photo (card #1)
+# ---------------------------------------------------------------------------
+
+@app.post("/api/capture")
+async def capture_photo(file: UploadFile):
+    """Receive a captured photo frame, save it, publish to identify pipeline."""
+    trace_id = str(uuid.uuid4())
+    _COUNTERS["captures_received"] += 1
+
+    ext = pathlib.Path(file.filename).suffix if file.filename else ".jpg"
+    photo_filename = f"{trace_id}{ext}"
+    photo_path = UPLOAD_DIR / photo_filename
+
+    content = await file.read()
+    photo_path.write_bytes(content)
+
+    publish_event(CHANNEL_CAPTURE, trace_id, "captured", {
+        "photo_filename": photo_filename,
+        "photo_path": str(photo_path),
+    }, source=SERVICE_NAME)
+
+    store_trace_state(trace_id, {
+        "status": "captured",
+        "photo_filename": photo_filename,
+    })
+
+    asyncio.create_task(run_identification(trace_id, str(photo_path)))
+
+    return {
+        "trace_id": trace_id,
+        "photo_filename": photo_filename,
+        "status": "captured",
+    }
+
+
+@app.get("/api/capture/{trace_id}")
+async def capture_status(trace_id: str):
+    """Return the live pipeline status for a capture (driven by Redis state)."""
+    state = get_trace_state(trace_id)
+    if not state:
+        return {"trace_id": trace_id, "status": "unknown"}
+    return state
+
+# ---------------------------------------------------------------------------
+# Identification — Vision Router (card #2/#3/#4)
+# ---------------------------------------------------------------------------
+
+async def run_identification(trace_id: str, photo_path: str):
+    """Route photo to primary and secondary vision sources, cross-check results."""
+    _COUNTERS["identifications_run"] += 1
+
+    primary_result = None
+    secondary_result = None
+
+    async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT) as client:
+        try:
+            primary_result = await identify_with_source(
+                client, VISION_PRIMARY, VISION_PRIMARY_KEY, photo_path, trace_id
+            )
+        except Exception as e:
+            logger.warning(f"[{trace_id}] Primary source ({VISION_PRIMARY}) failed: {e}")
+            publish_dead_letter(trace_id, "identify:primary", str(e))
+
+        try:
+            secondary_result = await identify_with_source(
+                client, VISION_SECONDARY, VISION_SECONDARY_KEY, photo_path, trace_id
+            )
+        except Exception as e:
+            logger.warning(f"[{trace_id}] Secondary source ({VISION_SECONDARY}) failed: {e}")
+            publish_dead_letter(trace_id, "identify:secondary", str(e))
+
+    if primary_result and secondary_result:
+        agree = primary_result["name"].lower() == secondary_result["name"].lower()
+        confidence = "high" if agree else "low"
+        identified_name = (
+            primary_result["name"]
+            if agree
+            else f"{primary_result['name']} / {secondary_result['name']}"
+        )
+    elif primary_result:
+        confidence = "medium"
+        identified_name = primary_result["name"]
+    elif secondary_result:
+        confidence = "medium"
+        identified_name = secondary_result["name"]
+    else:
+        publish_event(CHANNEL_IDENTIFY, trace_id, "identify:failed", {
+            "error": "Both vision sources failed",
+        }, source=SERVICE_NAME)
+        publish_dead_letter(trace_id, "identify", "Both sources failed")
+        store_trace_state(trace_id, {
+            "status": "failed",
+            "error": "Both vision sources failed",
+        })
+        return
+
+    bbox = (primary_result or secondary_result or {}).get("bbox")
+
+    result = {
+        "trace_id": trace_id,
+        "identified_name": identified_name,
+        "confidence": confidence,
+        "bbox": bbox,
+        "primary_source": VISION_PRIMARY if primary_result else None,
+        "secondary_source": VISION_SECONDARY if secondary_result else None,
+    }
+
+    store_trace_state(trace_id, {
+        "status": "identified",
+        "identified_name": identified_name,
+        "confidence": confidence,
+        "bbox": bbox,
+    })
+
+    publish_event(CHANNEL_IDENTIFY, trace_id, f"identified:{confidence}", result,
+                  source=SERVICE_NAME)
+
+    asyncio.create_task(run_pricing(trace_id, identified_name))
+
+
+async def identify_with_source(client: httpx.AsyncClient, source: str, api_key: str,
+                                photo_path: str, trace_id: str) -> Optional[dict]:
+    """Dispatch to the appropriate vision API implementation."""
+    source_lower = source.lower()
+
+    if source_lower == "google":
+        return await _identify_google(client, api_key, photo_path, trace_id)
+    elif source_lower in ("openai", "local"):
+        return await _identify_openai(client, api_key, photo_path, trace_id)
+    else:
+        logger.warning(f"[{trace_id}] Unknown vision source: {source} — using placeholder")
+        await asyncio.sleep(0.5)
+        return {
+            "name": f"Item identified by {source}",
+            "category": "general",
+            "source": source,
+            "raw_confidence": 0.5,
+        }
+
+
+# ---------------------------------------------------------------------------
+# Google Vision API (card #3)
+# ---------------------------------------------------------------------------
+
+GOOGLE_VISION_URL = "https://vision.googleapis.com/v1/images:annotate"
+
+
+async def _identify_google(client: httpx.AsyncClient, api_key: str,
+                            photo_path: str, trace_id: str) -> Optional[dict]:
+    """
+    Send frame to Google Cloud Vision API.
+    Uses LABEL_DETECTION + OBJECT_LOCALIZATION + WEB_DETECTION.
+    Structures response into (name, category, confidence).
+    """
+    if not api_key:
+        logger.warning(f"[{trace_id}] Google Vision API key not configured")
+        return None
+
+    try:
+        image_bytes = pathlib.Path(photo_path).read_bytes()
+        encoded = base64.b64encode(image_bytes).decode("utf-8")
+    except Exception as e:
+        logger.error(f"[{trace_id}] Failed to read image for Google Vision: {e}")
+        return None
+
+    payload = {
+        "requests": [{
+            "image": {"content": encoded},
+            "features": [
+                {"type": "LABEL_DETECTION", "maxResults": 10},
+                {"type": "OBJECT_LOCALIZATION", "maxResults": 5},
+                {"type": "WEB_DETECTION", "maxResults": 5},
+            ],
+        }]
+    }
+
+    url = f"{GOOGLE_VISION_URL}?key={api_key}"
+    logger.info(f"[{trace_id}] Calling Google Vision API...")
+
+    try:
+        resp = await client.post(url, json=payload)
+        resp.raise_for_status()
+        data = resp.json()
+    except httpx.HTTPError as e:
+        logger.error(f"[{trace_id}] Google Vision HTTP error: {e}")
+        return None
+
+    responses = data.get("responses", [])
+    if not responses:
+        logger.warning(f"[{trace_id}] Google Vision returned empty response")
+        return None
+
+    r = responses[0]
+    if "error" in r:
+        logger.error(f"[{trace_id}] Google Vision API error: {r['error']}")
+        return None
+
+    # Parse structured identity from response
+    objects = r.get("localizedObjectAnnotations", [])
+    object_name = objects[0]["name"] if objects else None
+
+    labels = r.get("labelAnnotations", [])
+    label_names = [l["description"] for l in labels[:10]] if labels else []
+
+    web = r.get("webDetection", {})
+    web_entities = web.get("webEntities", [])
+    web_entity_names = [
+        e["description"]
+        for e in web_entities[:5]
+        if "description" in e and e.get("score", 0) > 0.5
+    ] if web_entities else []
+
+    # Build descriptive name
+    material_keywords = [
+        "leather", "wood", "metal", "glass", "gold", "silver", "cotton",
+        "wool", "plastic", "oak", "mahogany", "walnut", "cherry",
+        "marble", "granite", "ceramic", "porcelain", "steel", "aluminum",
+    ]
+
+    if object_name:
+        name_parts = [object_name]
+        for label in label_names:
+            l_lower = label.lower()
+            if l_lower != object_name.lower() and l_lower not in name_parts[0].lower():
+                if any(kw in l_lower for kw in material_keywords):
+                    name_parts.insert(0, label)
+                    break
+        identified_name = " ".join(name_parts)
+    elif label_names:
+        identified_name = ", ".join(label_names[:3])
+    elif web_entity_names:
+        identified_name = web_entity_names[0]
+    else:
+        identified_name = "Unidentified item"
+
+    category = label_names[0] if label_names else "general"
+
+    if objects:
+        raw_confidence = objects[0].get("score", 0.5)
+    elif labels:
+        raw_confidence = labels[0].get("score", 0.5)
+    else:
+        raw_confidence = 0.3
+
+    logger.info(
+        f"[{trace_id}] Google Vision: \"{identified_name}\" "
+        f"(category={category}, confidence={raw_confidence:.2f})"
+    )
+
+    return {
+        "name": identified_name,
+        "category": category,
+        "source": "google",
+        "raw_confidence": raw_confidence,
+    }
+# ---------------------------------------------------------------------------
+# OpenAI GPT-4V / GPT-4o (card #4)
+# ---------------------------------------------------------------------------
+
+# Center-crop: assume the object is centered — crop the center square of
+# CROP_FRAC of the image's short side before sending to the vision model.
+# Improves identification by removing background clutter.
+CROP_FRAC = 0.55
+
+
+def _center_crop_encoded(photo_path: str):
+    """Return (base64 JPEG of the center crop, geometry dict)."""
+    img = Image.open(pathlib.Path(photo_path))
+    W, H = img.size
+    side = int(min(W, H) * CROP_FRAC)
+    x = (W - side) // 2
+    y = (H - side) // 2
+    crop = img.crop((x, y, x + side, y + side))
+    buf = io.BytesIO()
+    crop.save(buf, format="JPEG")
+    encoded = base64.b64encode(buf.getvalue()).decode("utf-8")
+    return encoded, {"W": W, "H": H, "x": x, "y": y, "side": side}
+
+
+def _regex_bbox(text: str):
+    """Extract a 4-number bbox from 'bbox(x1,y1),(x2,y2)' style output."""
+    m = re.search(r"\((\d+)[,\s]+(\d+)\)[,\s]*\((\d+)[,\s]+(\d+)\)", text)
+    return [float(v) for v in m.groups()] if m else None
+
+async def _identify_openai(client: httpx.AsyncClient, api_key: str,
+                            photo_path: str, trace_id: str) -> Optional[dict]:
+    """
+    Send frame to an OpenAI-compatible vision LLM (OpenAI or local LM Studio).
+    Returns structured JSON: {name, category, confidence}.
+    """
+    if not api_key:
+        logger.warning(f"[{trace_id}] OpenAI API key not configured")
+        return None
+
+    try:
+        encoded, geo = _center_crop_encoded(photo_path)
+    except Exception as e:
+        logger.error(f"[{trace_id}] Failed to read/crop image for OpenAI: {e}")
+        return None
+
+    payload = {
+        "model": LLM_MODEL,
+        "messages": [{
+            "role": "user",
+            "content": [
+                {
+                    "type": "text",
+                    "text": (
+                        "Identify the main object in this image. Return ONLY a JSON "
+                        "object with keys: \"name\" (a short plain-string noun phrase, "
+                        "e.g. \"Wooden Chair\", no nested objects), \"category\" "
+                        "(one-word: furniture, jewelry, electronics, appliance, art, "
+                        "clothing, tool), \"confidence\" (a float 0.0-1.0), and "
+                        "\"bbox\" (the object's bounding box as a string "
+                        "\"x1,y1,x2,y2\" with coordinates normalized to 1000, "
+                        "top-left origin). No other text."
+                    ),
+                },
+                {
+                    "type": "image_url",
+                    "image_url": {"url": f"data:image/jpeg;base64,{encoded}"},
+                },
+            ],
+        }],
+        "max_tokens": 200,
+        "temperature": 0.0,
+    }
+
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+
+    logger.info(f"[{trace_id}] Calling vision LLM ({LLM_MODEL})...")
+
+    try:
+        resp = await client.post(f"{LLM_BASE_URL}/chat/completions", json=payload, headers=headers)
+        resp.raise_for_status()
+        data = resp.json()
+    except httpx.HTTPError as e:
+        logger.error(f"[{trace_id}] OpenAI HTTP error: {e}")
+        return None
+
+    # Parse structured JSON from the LLM response. Local models are
+    # unpredictable — coerce "name" to a plain string and "confidence" to a
+    # float regardless of what shape the model returns.
+    try:
+        content = data["choices"][0]["message"]["content"]
+        content = content.strip()
+        # Strip markdown code fences if present
+        if content.startswith("```"):
+            content = content.split("\n", 1)[1] if "\n" in content else content[3:]
+            if content.endswith("```"):
+                content = content[:-3]
+        logger.info(f"[{trace_id}] LLM raw: {content[:200]}")
+        result = json.loads(content.strip())
+
+        name = result.get("name", "Unknown")
+        if isinstance(name, dict):
+            # Prefer a descriptive key; fall back to joining all values.
+            for key in ("detailed", "name", "description", "title", "object"):
+                if key in name and name[key]:
+                    name = str(name[key])
+                    break
+            else:
+                name = " ".join(str(v) for v in name.values() if v)
+        elif isinstance(name, list):
+            name = " ".join(str(v) for v in name if v)
+        elif not isinstance(name, str):
+            name = str(name)
+
+        category = result.get("category", "general")
+        if isinstance(category, dict):
+            category = " ".join(str(v) for v in category.values() if v)
+        elif not isinstance(category, str):
+            category = str(category)
+
+        raw_conf = result.get("confidence", 0.5)
+        try:
+            confidence = float(raw_conf)
+        except (TypeError, ValueError):
+            confidence = 0.5
+
+        # Parse bounding box (crop-relative, 0-1000) and map to full-frame
+        # fractions so the frontend can draw it on the original photo.
+        bbox = None
+        bbox_raw = result.get("bbox")
+        if isinstance(bbox_raw, str):
+            nums = []
+            for part in bbox_raw.replace("(", "").replace(")", "").split(","):
+                try:
+                    nums.append(float(part.strip()))
+                except ValueError:
+                    break
+            if len(nums) == 4:
+                bbox = nums
+        elif isinstance(bbox_raw, list) and len(bbox_raw) == 4:
+            bbox = [float(v) for v in bbox_raw]
+
+        if bbox is None:
+            bbox = _regex_bbox(content)
+
+        full_bbox = None
+        if bbox is not None:
+            try:
+                bx1, by1, bx2, by2 = [v / 1000.0 for v in bbox]
+                W, H, cx, cy, side = geo["W"], geo["H"], geo["x"], geo["y"], geo["side"]
+                full_bbox = [
+                    round((cx + bx1 * side) / W, 4),
+                    round((cy + by1 * side) / H, 4),
+                    round((cx + bx2 * side) / W, 4),
+                    round((cy + by2 * side) / H, 4),
+                ]
+            except (TypeError, ValueError, ZeroDivisionError):
+                full_bbox = None
+
+        return {
+            "name": name or "Unknown",
+            "category": category or "general",
+            "source": "openai",
+            "raw_confidence": confidence,
+            "bbox": full_bbox,
+        }
+    except (KeyError, json.JSONDecodeError, IndexError, TypeError) as e:
+        logger.error(f"[{trace_id}] Failed to parse LLM response: {e}")
+        return None
+
+
+
+# ---------------------------------------------------------------------------
+# Pricing — Value Estimation (card #5)
+# ---------------------------------------------------------------------------
+
+async def run_pricing(trace_id: str, identified_name: str):
+    """Estimate replacement value via web search + LLM fallback."""
+    _COUNTERS["prices_estimated"] += 1
+
+    value = None
+    value_source = ""
+
+    try:
+        async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT) as client:
+            value = await search_price(client, identified_name, trace_id)
+            if value is not None:
+                value_source = "web_search"
+    except Exception as e:
+        logger.warning(f"[{trace_id}] Web search failed: {e}")
+        publish_dead_letter(trace_id, "price:search", str(e))
+
+    if value is None:
+        try:
+            async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT) as client:
+                value = await llm_estimate(client, identified_name, trace_id)
+                if value is not None:
+                    value_source = "llm"
+        except Exception as e:
+            logger.warning(f"[{trace_id}] LLM estimate failed: {e}")
+            publish_dead_letter(trace_id, "price:llm", str(e))
+
+    if value is None:
+        publish_event(CHANNEL_PRICE, trace_id, "price:failed", {
+            "identified_name": identified_name,
+            "error": "Could not estimate value",
+        }, source=SERVICE_NAME)
+        publish_dead_letter(trace_id, "price", "All pricing sources failed")
+        store_trace_state(trace_id, {
+            "status": "identified",
+            "identified_name": identified_name,
+            "price_error": "Could not estimate value",
+        })
+        return
+
+    result = {
+        "trace_id": trace_id,
+        "identified_name": identified_name,
+        "estimated_value": value,
+        "value_source": value_source,
+    }
+
+    # Carry the identification confidence + bbox forward into the priced state
+    # so the UI can show them (the pricing step doesn't re-derive them).
+    prior = get_trace_state(trace_id)
+    store_trace_state(trace_id, {
+        "status": "priced",
+        "identified_name": identified_name,
+        "confidence": prior.get("confidence", ""),
+        "bbox": prior.get("bbox"),
+        "estimated_value": value,
+        "value_source": value_source,
+    })
+
+    publish_event(CHANNEL_PRICE, trace_id, f"priced:{value_source}", result,
+                  source=SERVICE_NAME)
+
+
+# ---------------------------------------------------------------------------
+# Pricing — SerpAPI web search (card #5 — primary)
+# ---------------------------------------------------------------------------
+
+SERPAPI_URL = "https://serpapi.com/search"
+
+
+async def search_price(client: httpx.AsyncClient, item_name: str, trace_id: str) -> Optional[float]:
+    """Search the web for retail/replacement price via SerpAPI."""
+    api_key = SEARCH_API_KEY
+    if not api_key:
+        logger.warning(f"[{trace_id}] SerpAPI key not configured — skipping web search")
+        return None
+
+    params = {
+        "engine": "google_shopping",
+        "q": f"{item_name} price",
+        "api_key": api_key,
+        "gl": "us",
+        "hl": "en",
+    }
+
+    logger.info(f"[{trace_id}] SerpAPI shopping: \"{item_name}\"")
+
+    try:
+        resp = await client.get(SERPAPI_URL, params=params)
+        resp.raise_for_status()
+        data = resp.json()
+    except httpx.HTTPError as e:
+        logger.warning(f"[{trace_id}] SerpAPI HTTP error: {e}")
+        return None
+
+    shopping_results = data.get("shopping_results", [])
+    if shopping_results:
+        first = shopping_results[0]
+        price = _extract_price(first.get("price"))
+        if price is not None:
+            logger.info(f"[{trace_id}] SerpAPI shopping: ${price:.2f}")
+            return price
+
+    # Fallback: regular Google search with price regex
+    params["engine"] = "google"
+    params["q"] = f"{item_name} replacement cost retail price USD"
+
+    try:
+        resp = await client.get(SERPAPI_URL, params=params)
+        resp.raise_for_status()
+        data = resp.json()
+    except httpx.HTTPError as e:
+        logger.warning(f"[{trace_id}] SerpAPI regular search error: {e}")
+        return None
+
+    kg = data.get("knowledge_graph", {})
+    price_str = kg.get("price")
+    if price_str:
+        price = _extract_price(str(price_str))
+        if price is not None:
+            logger.info(f"[{trace_id}] Knowledge graph price: ${price:.2f}")
+            return price
+
+    organic = data.get("organic_results", [])
+    for result in organic[:5]:
+        text = f"{result.get('title', '')} {result.get('snippet', '')}"
+        price = _extract_price_from_text(text)
+        if price is not None and 0.50 < price < 1_000_000:
+            logger.info(f"[{trace_id}] SerpAPI snippet price: ${price:.2f}")
+            return price
+
+    logger.info(f"[{trace_id}] SerpAPI: no price found")
+    return None
+
+
+def _extract_price(raw: str | None) -> Optional[float]:
+    """Extract float from price string like '$1,299.99'."""
+    if not raw:
+        return None
+    cleaned = raw.replace("$", "").replace(",", "").replace("£", "").replace("€", "").strip()
+    try:
+        return float(cleaned)
+    except ValueError:
+        return None
+
+
+def _extract_price_from_text(text: str) -> Optional[float]:
+    """Find dollar amount in text via regex."""
+    import re
+    patterns = [
+        r'\$[\s]*([\d,]+(?:\.\d{2})?)',
+        r'([\d,]+(?:\.\d{2})?)\s*(?:USD|dollars)',
+    ]
+    for pat in patterns:
+        match = re.search(pat, text)
+        if match:
+            return _extract_price(match.group(1) if pat.startswith(r'\$') else match.group(1))
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Pricing — LLM estimate (card #5 — fallback)
+# ---------------------------------------------------------------------------
+
+async def llm_estimate(client: httpx.AsyncClient, item_name: str, trace_id: str) -> Optional[float]:
+    """Ask OpenAI to estimate replacement cost. Returns float or None."""
+    api_key = LLM_API_KEY
+    if not api_key:
+        logger.warning(f"[{trace_id}] LLM API key not configured")
+        return None
+
+    payload = {
+        "model": LLM_MODEL,
+        "messages": [{
+            "role": "user",
+            "content": (
+                f"What is the current retail replacement cost of: {item_name}?\n"
+                "Return ONLY JSON: {\"estimated_value\": <float USD>, "
+                "\"confidence\": <0.0-1.0>}. No other text."
+            ),
+        }],
+        "max_tokens": 100,
+        "temperature": 0.0,
+    }
+
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+
+    logger.info(f"[{trace_id}] LLM price estimate: \"{item_name}\"")
+
+    try:
+        resp = await client.post(f"{LLM_BASE_URL}/chat/completions", json=payload, headers=headers)
+        resp.raise_for_status()
+        data = resp.json()
+    except httpx.HTTPError as e:
+        logger.error(f"[{trace_id}] LLM HTTP error: {e}")
+        return None
+
+    try:
+        content = data["choices"][0]["message"]["content"]
+        content = content.strip()
+        if content.startswith("```"):
+            content = content.split("\n", 1)[1] if "\n" in content else content[3:]
+            if content.endswith("```"):
+                content = content[:-3]
+        result = json.loads(content.strip())
+        value = result.get("estimated_value")
+        if isinstance(value, (int, float)) and value > 0:
+            conf = result.get("confidence", 0.5)
+            logger.info(f"[{trace_id}] LLM estimate: ${value:.2f} (confidence={conf:.2f})")
+            return float(value)
+    except (KeyError, json.JSONDecodeError, IndexError) as e:
+        logger.error(f"[{trace_id}] Failed to parse LLM price: {e}")
+
+    return None
+
+# ---------------------------------------------------------------------------
+# Inventory — Catalog CRUD (card #6)
+# ---------------------------------------------------------------------------
+
+@app.get("/api/inventory")
+async def list_inventory(archived: str = "false", show_all: str = "false"):
+    """List cataloged items. Default: non-archived only.
+       ?archived=true — only archived. ?show_all=true — everything."""
+    conn = get_db()
+    if show_all.lower() == "true":
+        rows = conn.execute(
+            "SELECT * FROM inventory ORDER BY created_at DESC"
+        ).fetchall()
+    elif archived.lower() == "true":
+        rows = conn.execute(
+            "SELECT * FROM inventory WHERE archived = 1 ORDER BY created_at DESC"
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT * FROM inventory WHERE archived = 0 ORDER BY created_at DESC"
+        ).fetchall()
+    conn.close()
+    return [dict(row) for row in rows]
+
+
+@app.patch("/api/inventory/{item_id}/archive")
+async def archive_item(item_id: str):
+    """Archive an item — hides it from inventory and coverage."""
+    conn = get_db()
+    row = conn.execute("SELECT * FROM inventory WHERE id = ?", (item_id,)).fetchone()
+    if not row:
+        conn.close()
+        raise HTTPException(status_code=404, detail="Item not found")
+    conn.execute("UPDATE inventory SET archived = 1, updated_at = ? WHERE id = ?",
+                 (datetime.now(timezone.utc).isoformat(), item_id))
+    conn.commit()
+    row = conn.execute("SELECT * FROM inventory WHERE id = ?", (item_id,)).fetchone()
+    conn.close()
+    return dict(row)
+
+
+@app.patch("/api/inventory/{item_id}/restore")
+async def restore_item(item_id: str):
+    """Restore an archived item back to active inventory."""
+    conn = get_db()
+    row = conn.execute("SELECT * FROM inventory WHERE id = ?", (item_id,)).fetchone()
+    if not row:
+        conn.close()
+        raise HTTPException(status_code=404, detail="Item not found")
+    conn.execute("UPDATE inventory SET archived = 0, updated_at = ? WHERE id = ?",
+                 (datetime.now(timezone.utc).isoformat(), item_id))
+    conn.commit()
+    row = conn.execute("SELECT * FROM inventory WHERE id = ?", (item_id,)).fetchone()
+    conn.close()
+    return dict(row)
+
+
+@app.get("/api/inventory/{item_id}")
+async def get_inventory_item(item_id: str):
+    """Get a single inventory item."""
+    conn = get_db()
+    row = conn.execute("SELECT * FROM inventory WHERE id = ?", (item_id,)).fetchone()
+    conn.close()
+    if not row:
+        raise HTTPException(status_code=404, detail="Item not found")
+    return dict(row)
+
+
+@app.post("/api/inventory")
+async def add_to_inventory(item: CatalogItem):
+    """Add an identified and priced item to the catalog."""
+    _COUNTERS["items_cataloged"] += 1
+    item_id = str(uuid.uuid4())
+    now = datetime.now(timezone.utc).isoformat()
+
+    conn = get_db()
+    conn.execute(
+        """INSERT INTO inventory (id, photo_path, identified_name, category,
+           estimated_value, value_source, confidence, narration,
+           latitude, longitude, captured_at, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            item_id, item.photo_filename, item.identified_name, item.category,
+            item.estimated_value, item.value_source, item.confidence,
+            item.narration,
+            item.latitude, item.longitude, item.captured_at,
+            now, now,
+        ),
+    )
+    conn.commit()
+
+    row = conn.execute("SELECT * FROM inventory WHERE id = ?", (item_id,)).fetchone()
+    conn.close()
+
+    result = dict(row)
+
+    publish_event(CHANNEL_CATALOG, item.trace_id, "cataloged", {
+        "item_id": item_id,
+        "identified_name": item.identified_name,
+        "estimated_value": item.estimated_value,
+    }, source=SERVICE_NAME)
+
+    return result
+
+
+@app.patch("/api/inventory/{item_id}")
+async def update_inventory_item(item_id: str, item: InventoryItem):
+    """Update an inventory item."""
+    conn = get_db()
+    existing = conn.execute(
+        "SELECT * FROM inventory WHERE id = ?", (item_id,)
+    ).fetchone()
+    if not existing:
+        conn.close()
+        raise HTTPException(status_code=404, detail="Item not found")
+
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute(
+        """UPDATE inventory SET identified_name=?, category=?, estimated_value=?,
+           value_source=?, confidence=?, updated_at=? WHERE id=?""",
+        (
+            item.identified_name, item.category, item.estimated_value,
+            item.value_source, item.confidence, now, item_id,
+        ),
+    )
+    conn.commit()
+
+    row = conn.execute("SELECT * FROM inventory WHERE id = ?", (item_id,)).fetchone()
+    conn.close()
+    return dict(row)
+
+
+@app.delete("/api/inventory/{item_id}")
+async def delete_inventory_item(item_id: str):
+    """Remove an item from the catalog."""
+    conn = get_db()
+    existing = conn.execute(
+        "SELECT * FROM inventory WHERE id = ?", (item_id,)
+    ).fetchone()
+    if not existing:
+        conn.close()
+        raise HTTPException(status_code=404, detail="Item not found")
+
+    conn.execute("DELETE FROM inventory WHERE id = ?", (item_id,))
+    conn.commit()
+    conn.close()
+    return {"status": "deleted", "id": item_id}
+
+
+# ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Documents — Certificate / Appraisal capture (card #12)
+# ---------------------------------------------------------------------------
+
+class DocumentUpload(BaseModel):
+    doc_type: str = "other"  # certificate, appraisal, receipt, other
+
+
+@app.post("/api/inventory/{item_id}/documents")
+async def add_document(item_id: str, file: UploadFile):
+    """Upload a supporting document photo for an inventory item."""
+    conn = get_db()
+    existing = conn.execute("SELECT * FROM inventory WHERE id = ?", (item_id,)).fetchone()
+    if not existing:
+        conn.close()
+        raise HTTPException(status_code=404, detail="Item not found")
+
+    doc_id = str(uuid.uuid4())
+    ext = pathlib.Path(file.filename).suffix if file.filename else ".jpg"
+    doc_filename = f"doc-{doc_id}{ext}"
+    doc_path = UPLOAD_DIR / doc_filename
+
+    content = await file.read()
+    doc_path.write_bytes(content)
+
+    # Determine doc_type from query param or default
+    doc_type = "other"
+
+    conn.execute(
+        """INSERT INTO documents (id, inventory_id, photo_path, doc_type)
+           VALUES (?, ?, ?, ?)""",
+        (doc_id, item_id, doc_filename, doc_type),
+    )
+    conn.commit()
+
+    row = conn.execute("SELECT * FROM documents WHERE id = ?", (doc_id,)).fetchone()
+    conn.close()
+
+    return dict(row)
+
+
+@app.get("/api/inventory/{item_id}/documents")
+async def list_documents(item_id: str):
+    """List all supporting documents for an inventory item."""
+    conn = get_db()
+    rows = conn.execute(
+        "SELECT * FROM documents WHERE inventory_id = ? ORDER BY created_at DESC",
+        (item_id,),
+    ).fetchall()
+    conn.close()
+    return [dict(row) for row in rows]
+
+
+@app.delete("/api/documents/{doc_id}")
+async def delete_document(doc_id: str):
+    """Remove a supporting document."""
+    conn = get_db()
+    existing = conn.execute("SELECT * FROM documents WHERE id = ?", (doc_id,)).fetchone()
+    if not existing:
+        conn.close()
+        raise HTTPException(status_code=404, detail="Document not found")
+
+    # Delete the file
+    doc_path = UPLOAD_DIR / existing["photo_path"]
+    try:
+        doc_path.unlink(missing_ok=True)
+    except Exception:
+        pass
+
+    conn.execute("DELETE FROM documents WHERE id = ?", (doc_id,))
+    conn.commit()
+    conn.close()
+    return {"status": "deleted", "id": doc_id}
+
+
+# ---------------------------------------------------------------------------
+# Policies — Upload + Parse + CRUD (cards #14-#17)
+# ---------------------------------------------------------------------------
+
+POLICY_UPLOAD_DIR = UPLOAD_DIR / "policies"
+POLICY_UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _extract_pdf_text(file_path: str) -> str:
+    """Extract text from a PDF using pdfplumber."""
+    try:
+        import pdfplumber
+        text_parts = []
+        with pdfplumber.open(file_path) as pdf:
+            for page in pdf.pages:
+                t = page.extract_text()
+                if t:
+                    text_parts.append(t)
+        return "\n\n".join(text_parts)
+    except Exception as e:
+        logger.error(f"PDF text extraction failed: {e}")
+        return ""
+
+
+@app.post("/api/policies/upload")
+async def upload_policy(file: UploadFile | None = None, body: PolicyUploadRequest | None = None):
+    """Upload a policy: PDF file, URL, or pasted text."""
+    policy_id = str(uuid.uuid4())
+    raw_text = ""
+    name = ""
+
+    if file:
+        ext = pathlib.Path(file.filename).suffix if file.filename else ".pdf"
+        policy_filename = f"policy-{policy_id}{ext}"
+        policy_path = POLICY_UPLOAD_DIR / policy_filename
+        content = await file.read()
+        policy_path.write_bytes(content)
+        raw_text = _extract_pdf_text(str(policy_path))
+        name = file.filename or "Uploaded Policy"
+    elif body and body.url:
+        try:
+            async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT) as client:
+                resp = await client.get(body.url)
+                resp.raise_for_status()
+                content_bytes = resp.content
+                url_path = pathlib.PurePosixPath(body.url.split("?")[0])
+                ext = url_path.suffix if url_path.suffix in (".pdf", ".txt") else ".pdf"
+                policy_filename = f"policy-{policy_id}{ext}"
+                policy_path = POLICY_UPLOAD_DIR / policy_filename
+                policy_path.write_bytes(content_bytes)
+                raw_text = _extract_pdf_text(str(policy_path)) if ext == ".pdf" else content_bytes.decode("utf-8", errors="replace")
+                name = body.name or url_path.name or "Policy from URL"
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Failed to fetch URL: {e}")
+    elif body and body.text:
+        raw_text = body.text
+        name = body.name or "Pasted Policy Text"
+    else:
+        raise HTTPException(status_code=400, detail="No file, URL, or text provided")
+
+    now = datetime.now(timezone.utc).isoformat()
+    conn = get_db()
+    conn.execute(
+        "INSERT INTO policies (id, name, raw_text, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
+        (policy_id, name, raw_text, now, now),
+    )
+    conn.execute("UPDATE policies SET active = 0 WHERE id != ?", (policy_id,))
+    conn.commit()
+    row = conn.execute("SELECT * FROM policies WHERE id = ?", (policy_id,)).fetchone()
+    conn.close()
+    return dict(row)
+
+
+@app.get("/api/policies")
+async def list_policies():
+    conn = get_db()
+    rows = conn.execute("SELECT * FROM policies ORDER BY created_at DESC").fetchall()
+    conn.close()
+    return [dict(row) for row in rows]
+
+
+async def _policy_with_sub_limits(policy: dict) -> dict:
+    conn = get_db()
+    subs = conn.execute("SELECT * FROM policy_sub_limits WHERE policy_id = ?", (policy["id"],)).fetchall()
+    conn.close()
+    policy["sub_limits"] = [dict(s) for s in subs]
+    return policy
+
+
+@app.get("/api/policies/active")
+async def get_active_policy():
+    conn = get_db()
+    row = conn.execute("SELECT * FROM policies WHERE active = 1 ORDER BY created_at DESC LIMIT 1").fetchone()
+    conn.close()
+    if not row:
+        raise HTTPException(status_code=404, detail="No active policy")
+    return await _policy_with_sub_limits(dict(row))
+
+
+@app.post("/api/policies/{policy_id}/parse")
+async def parse_policy(policy_id: str):
+    """Send policy text to LLM for structured extraction."""
+    conn = get_db()
+    row = conn.execute("SELECT * FROM policies WHERE id = ?", (policy_id,)).fetchone()
+    if not row:
+        conn.close()
+        raise HTTPException(status_code=404, detail="Policy not found")
+    raw_text = row["raw_text"]
+    conn.close()
+    if not raw_text:
+        raise HTTPException(status_code=400, detail="Policy has no text to parse")
+
+    api_key = LLM_API_KEY
+    if not api_key:
+        raise HTTPException(status_code=400, detail="LLM_API_KEY not configured")
+
+    prompt = (
+        "Extract structured insurance policy data from the following text. "
+        "Return ONLY a JSON object with these keys:\n"
+        "- policy_name: human-readable name\n"
+        "- overall_personal_property_limit: total PP limit in USD (number)\n"
+        "- deductible: deductible in USD (number)\n"
+        "- effective_date: YYYY-MM-DD\n- expiration_date: YYYY-MM-DD\n"
+        "- covered_address: the covered property address\n"
+        "- sub_limits: array of objects with: category (string), limit_amount (number), "
+        "exclusion (bool), description (string)\n"
+        "- special_conditions: array of objects with: condition (string), detail (string)\n"
+        "Flag business property exclusions, outbuilding coverage, scheduled-item riders.\n"
+        "If a field is not found, set to null or empty.\n\n"
+        f"Policy Text:\n{raw_text[:12000]}"
+    )
+
+    payload = {
+        "model": "gpt-4o", "messages": [{"role": "user", "content": prompt}],
+        "max_tokens": 2000, "temperature": 0.0,
+    }
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+
+    import time as _time
+    parsed_data = None
+    last_error = None
+    for _ in range(2):
+        try:
+            async with httpx.AsyncClient(timeout=60.0) as client:
+                resp = await client.post(LLM_API_URL, json=payload, headers=headers)
+                resp.raise_for_status()
+                data = resp.json()
+                content = data["choices"][0]["message"]["content"].strip()
+                if content.startswith("```"):
+                    content = content.split("\n", 1)[1] if "\n" in content else content[3:]
+                    if content.endswith("```"):
+                        content = content[:-3]
+                parsed_data = json.loads(content.strip())
+                break
+        except Exception as e:
+            last_error = str(e)
+            _time.sleep(2)
+
+    if parsed_data is None:
+        conn = get_db()
+        conn.execute("UPDATE policies SET reviewed = -1 WHERE id = ?", (policy_id,))
+        conn.commit()
+        conn.close()
+        raise HTTPException(status_code=422, detail=f"LLM parsing failed: {last_error}")
+
+    now = datetime.now(timezone.utc).isoformat()
+    conn = get_db()
+    conn.execute(
+        "UPDATE policies SET name=?, overall_limit=?, deductible=?, effective_date=?,"
+        " expiration_date=?, covered_address=?, reviewed=1, updated_at=? WHERE id=?",
+        (parsed_data.get("policy_name", row["name"]),
+         float(parsed_data.get("overall_personal_property_limit") or 0),
+         float(parsed_data.get("deductible") or 0),
+         parsed_data.get("effective_date", ""), parsed_data.get("expiration_date", ""),
+         parsed_data.get("covered_address", ""), now, policy_id))
+    conn.execute("DELETE FROM policy_sub_limits WHERE policy_id = ?", (policy_id,))
+    for sl in (parsed_data.get("sub_limits") or []):
+        sub_id = str(uuid.uuid4())
+        conn.execute(
+            "INSERT INTO policy_sub_limits (id, policy_id, category, limit_amount, exclusion, description)"
+            " VALUES (?, ?, ?, ?, ?, ?)",
+            (sub_id, policy_id, sl.get("category", "other"),
+             float(sl.get("limit_amount") or 0), 1 if sl.get("exclusion") else 0,
+             sl.get("description", "")))
+    conn.commit()
+    row = conn.execute("SELECT * FROM policies WHERE id = ?", (policy_id,)).fetchone()
+    conn.close()
+    result = await _policy_with_sub_limits(dict(row))
+    result["parsed_from_llm"] = parsed_data
+    return result
+@app.get("/api/policies/{policy_id}")
+async def get_policy(policy_id: str):
+    conn = get_db()
+    row = conn.execute("SELECT * FROM policies WHERE id = ?", (policy_id,)).fetchone()
+    if not row:
+@app.patch("/api/policies/{policy_id}")
+async def update_policy(policy_id: str, update: PolicyUpdate):
+    """Update a policy and its sub-limits after user review/edit."""
+    conn = get_db()
+    row = conn.execute("SELECT * FROM policies WHERE id = ?", (policy_id,)).fetchone()
+    if not row:
+        conn.close()
+        raise HTTPException(status_code=404, detail="Policy not found")
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute(
+        "UPDATE policies SET name=?, overall_limit=?, deductible=?, effective_date=?,"
+        " expiration_date=?, covered_address=?, reviewed=?, updated_at=? WHERE id=?",
+        (update.name or row["name"], update.overall_limit, update.deductible,
+         update.effective_date or row["effective_date"],
+         update.expiration_date or row["expiration_date"],
+         update.covered_address or row["covered_address"],
+         1 if update.reviewed else row["reviewed"], now, policy_id))
+    if update.sub_limits:
+        conn.execute("DELETE FROM policy_sub_limits WHERE policy_id = ?", (policy_id,))
+        for sl in update.sub_limits:
+            sub_id = str(uuid.uuid4())
+            conn.execute(
+                "INSERT INTO policy_sub_limits (id, policy_id, category, limit_amount,"
+                " exclusion, description, applies_to, rider) VALUES (?,?,?,?,?,?,?,?)",
+                (sub_id, policy_id, sl.category, sl.limit_amount,
+                 1 if sl.exclusion else 0, sl.description, sl.applies_to, 1 if sl.rider else 0))
+    conn.commit()
+    row = conn.execute("SELECT * FROM policies WHERE id = ?", (policy_id,)).fetchone()
+    conn.close()
+    return await _policy_with_sub_limits(dict(row))
+
+
+@app.patch("/api/policies/{policy_id}/activate")
+async def activate_policy(policy_id: str):
+    conn = get_db()
+    conn.execute("UPDATE policies SET active = 0")
+    conn.execute("UPDATE policies SET active = 1 WHERE id = ?", (policy_id,))
+    conn.commit()
+    row = conn.execute("SELECT * FROM policies WHERE id = ?", (policy_id,)).fetchone()
+    conn.close()
+    if not row:
+        raise HTTPException(status_code=404, detail="Policy not found")
+    return await _policy_with_sub_limits(dict(row))
+
+
+@app.delete("/api/policies/{policy_id}")
+async def delete_policy(policy_id: str):
+    conn = get_db()
+    conn.execute("DELETE FROM policy_sub_limits WHERE policy_id = ?", (policy_id,))
+    conn.execute("DELETE FROM policies WHERE id = ?", (policy_id,))
+    conn.commit()
+    conn.close()
+    return {"status": "deleted", "id": policy_id}
+        conn.close()
+        raise HTTPException(status_code=404, detail="Policy not found")
+    conn.close()
+    return await _policy_with_sub_limits(dict(row))
+
+# Debug endpoints
+# ---------------------------------------------------------------------------
+
+@app.get("/api/debug/events/{channel}")
+async def debug_channel(channel: str, limit: int = 10):
+    """Inspect recent messages on a Redis channel."""
+    return {
+        "channel": channel,
+        "note": "Use redis-cli MONITOR to inspect live pub/sub traffic.",
+# ---------------------------------------------------------------------------
+# Category Mapping — Items to Policy Sub-Limits (card #22)
+# ---------------------------------------------------------------------------
+
+CATEGORY_KEYWORDS: dict[str, list[str]] = {
+    "jewelry": ["jewelry", "ring", "necklace", "bracelet", "watch", "gold",
+                "diamond", "gem", "silver", "pendant", "earring"],
+    "electronics": ["laptop", "computer", "tablet", "phone", "tv", "television",
+                    "camera", "speaker", "headphone", "electronics", "monitor",
+                    "printer", "gaming", "console"],
+    "art": ["painting", "art", "sculpture", "canvas", "watercolor", "print",
+            "portrait", "framed", "drawing"],
+    "cash": ["cash", "currency", "coin", "money"],
+    "firearms": ["firearm", "gun", "rifle", "pistol", "shotgun", "revolver"],
+    "household_goods": ["furniture", "couch", "sofa", "chair", "table", "desk",
+                        "bed", "dresser", "bookshelf", "mattress", "cabinet",
+                        "rug", "carpet", "lamp", "mirror", "curtain", "appliance"],
+    "tools": ["tool", "power", "saw", "drill", "hammer", "wrench", "screwdriver"],
+    "clothing": ["clothing", "shirt", "jacket", "coat", "dress", "shoes", "boots",
+                 "pants", "jeans", "sweater", "suit", "hat"],
+}
+
+
+def map_category_to_policy_category(name: str | None, category: str | None,
+                                      category_override: str | None = None) -> str:
+    """Map an item's identity/category to a policy sub-limit category via keywords."""
+    if category_override:
+        return category_override.lower()
+    search = ((name or "") + " " + (category or "")).lower()
+    for policy_cat, keywords in CATEGORY_KEYWORDS.items():
+        for kw in keywords:
+            if kw in search:
+                return policy_cat
+    return "other"
+    }
+
+# ---------------------------------------------------------------------------
+# Coverage Comparison Engine (cards #18-#21)
+# ---------------------------------------------------------------------------
+
+@app.post("/api/compare-coverage")
+async def compare_coverage_all():
+    """Run comparison against active policy. Includes cross-policy check (card #21)."""
+    conn = get_db()
+    active = conn.execute(
+        "SELECT * FROM policies WHERE active = 1 ORDER BY created_at DESC LIMIT 1"
+    ).fetchone()
+    if not active:
+        conn.close()
+        raise HTTPException(status_code=404, detail="No active policy")
+    pid = active["id"]
+    conn.close()
+    result = await _run_comparison(pid)
+
+    # Cross-policy: see if other policies cover gaps
+    conn2 = get_db()
+    others = conn2.execute("SELECT * FROM policies WHERE id != ?", (pid,)).fetchall()
+    conn2.close()
+    if others:
+        xrefs: list[dict] = []
+        for item in result["items"]:
+            if item["coverage_status"] in ("coverage_gap", "not_covered"):
+                mc = item.get("mapped_category", "")
+                for op in others:
+                    c3 = get_db()
+                    ops = c3.execute(
+                        "SELECT * FROM policy_sub_limits WHERE policy_id=? AND category=?",
+                        (op["id"], mc)).fetchall()
+                    c3.close()
+                    for s in ops:
+                        if not s["exclusion"] and (s["limit_amount"] or 0) > 0:
+                            xrefs.append({
+                                "item_id": item["id"], "item_name": item["identified_name"],
+                                "gap_category": mc, "alternate_policy": op["name"],
+async def _run_comparison(policy_id: str) -> dict:
+    """Core comparison — categorizes items, checks limits, stores per-item results."""
+    conn = get_db()
+    policy = conn.execute("SELECT * FROM policies WHERE id = ?", (policy_id,)).fetchone()
+    if not policy:
+        conn.close()
+        return {"error": "Policy not found"}
+    subs = conn.execute("SELECT * FROM policy_sub_limits WHERE policy_id = ?", (policy_id,)).fetchall()
+    items = conn.execute("SELECT * FROM inventory WHERE archived = 0 ORDER BY created_at DESC").fetchall()
+
+    limits: dict[str, dict] = {}
+    for sl in subs:
+        limits[sl["category"].lower()] = {
+            "limit_amount": sl["limit_amount"], "exclusion": bool(sl["exclusion"]),
+            "description": sl["description"],
+        }
+    overall = float(policy["overall_limit"] or 0)
+    total_val = 0.0
+    cat_tots: dict[str, float] = {}
+    results: list[dict] = []
+
+    for item in items:
+        d = dict(item)
+        v = float(d["estimated_value"] or 0)
+        total_val += v
+        mapped = map_category_to_policy_category(d["identified_name"], d["category"], d["category_override"])
+        d["mapped_category"] = mapped
+
+        if mapped in limits and limits[mapped]["exclusion"]:
+            st, g = "not_covered", v
+            det = f"Category '{mapped}' is explicitly excluded"
+        elif mapped in limits:
+            ct = cat_tots.get(mapped, 0) + v
+            cat_tots[mapped] = ct
+            lim = limits[mapped]["limit_amount"]
+            if v > lim:
+                st, g = "coverage_gap", v - lim
+                det = f"Exceeds {mapped} sub-limit of ${lim:,.2f} by ${g:,.2f}"
+            else:
+                st, g = "covered", 0
+                det = f"Within {mapped} sub-limit of ${lim:,.2f}"
+        else:
+            st, g = "needs_validation", 0
+            det = "Unable to match to a policy category"
+
+        conn.execute("UPDATE inventory SET coverage_status=?, coverage_gap_amount=?, coverage_detail=? WHERE id=?",
+                     (st, g, det, d["id"]))
+        d.update(coverage_status=st, coverage_gap_amount=g, coverage_detail=det)
+        results.append(d)
+
+    # Aggregate gap: if category total exceeds sub-limit, mark all
+    for rd in results:
+        if rd["coverage_status"] == "covered":
+            m = rd.get("mapped_category", "")
+            ct = cat_tots.get(m, 0)
+            lim = limits.get(m, {}).get("limit_amount", 0)
+            if ct > lim > 0:
+                rd.update(coverage_status="coverage_gap", coverage_gap_amount=ct - lim,
+                          coverage_detail=f"Aggregate {m} total ${ct:,.2f} exceeds limit ${lim:,.2f}")
+                conn.execute("UPDATE inventory SET coverage_status=?, coverage_gap_amount=?, coverage_detail=? WHERE id=?",
+                             (rd["coverage_status"], rd["coverage_gap_amount"], rd["coverage_detail"], rd["id"]))
+
+    overall_gap = max(0, total_val - overall) if overall > 0 else 0
+    conn.commit()
+    conn.close()
+
+    cov = sum(1 for r in results if r["coverage_status"] == "covered")
+    nc = sum(1 for r in results if r["coverage_status"] == "not_covered")
+    g2 = sum(1 for r in results if r["coverage_status"] == "coverage_gap")
+    nv = sum(1 for r in results if r["coverage_status"] == "needs_validation")
+
+    return {
+        "policy_id": policy_id, "policy_name": policy["name"],
+        "overall_limit": overall, "deductible": float(policy["deductible"] or 0),
+        "total_value": total_val, "total_gap": overall_gap,
+        "summary": {"covered": cov, "coverage_gap": g2, "not_covered": nc, "needs_validation": nv},
+        "category_breakdowns": [{
+            "category": c, "total_value": t, "limit": limits.get(c, {}).get("limit_amount", 0),
+            "exclusion": limits.get(c, {}).get("exclusion", False),
+            "gap": max(0, t - limits.get(c, {}).get("limit_amount", 0))
+            if not limits.get(c, {}).get("exclusion", False) else t,
+        } for c, t in cat_tots.items()],
+        "items": results,
+    }
+                                "alternate_limit": s["limit_amount"],
+                            })
+        if xrefs:
+            result["cross_policy"] = xrefs
+    return result
+
+@app.get("/api/logs/{service}")
+async def get_logs(service: str):
+    """Return recent log entries (placeholder)."""
+    return {"service": service, "note": "Log endpoint placeholder."}
+
+
+# ---------------------------------------------------------------------------
+# Startup
+# ---------------------------------------------------------------------------
+
+@app.on_event("startup")
+async def startup():
+    init_db()
+    logger.info(f"{SERVICE_NAME} v{SERVICE_VERSION} started")
+    logger.info(f"  Vision primary: {VISION_PRIMARY}, secondary: {VISION_SECONDARY}")
+    logger.info(f"  Redis: {REDIS_URL}")
+    logger.info(f"  DB: {DB_PATH}")
